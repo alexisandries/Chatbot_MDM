@@ -153,7 +153,7 @@ def _render_login_page() -> None:
     _, col, _ = st.columns([1, 2, 1])
 
     with col:
-        st.title("🔐 MdM Translation Tool")
+        st.title("🔐 MdM IA Tool")
         st.write(
             "Please enter your credentials to access the application. "
             "Contact your administrator if you do not have access."
