@@ -16,6 +16,17 @@ DESIGN NOTES
   conditions, which the UI layer is responsible for catching and
   presenting to the user.
 
+WHAT IS AND IS NOT EXTRACTED
+============================
+- DOCX: paragraphs and tables, read in their real document order so a
+  table's text stays near the paragraphs around it. Text boxes (text
+  stored in drawing shapes) are not extracted.
+- PPTX: text frames (titles, bullets, text boxes) and tables, slide by
+  slide.
+- XLSX: every cell of every sheet.
+- PDF: the text layer of every page. Scanned, image-only PDFs have no
+  text layer and yield little or nothing (no OCR is performed).
+
 ABOUT EXTRACTED TEXT QUALITY
 ============================
 Text pulled from PDFs and slide decks is often dense or out of order:
@@ -29,6 +40,9 @@ from io import BytesIO
 
 import fitz  # PyMuPDF
 from docx import Document
+from docx.document import Document as _DocxDocument
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 from pptx import Presentation
 
@@ -76,23 +90,97 @@ def read_pdf(file) -> str:
     return "".join(text_parts)
 
 
-def read_pptx(file) -> str:
-    """Extract text from a PowerPoint presentation.
+def _table_to_text(table: Table) -> str:
+    """Flatten a Word table into text, one line per row.
 
-    Walks every slide and collects the text of every shape that has a
-    text frame (titles, bullet points, text boxes).
+    Cells within a row are separated by tabs; rows are separated by
+    newlines. This keeps the tabular content readable and groups each
+    row's cells together.
+
+    Args:
+        table: A python-docx Table object.
+
+    Returns:
+        The table's text. Empty cells contribute an empty string.
+    """
+    row_lines = []
+    for row in table.rows:
+        cells_text = [cell.text.strip() for cell in row.cells]
+        row_lines.append("\t".join(cells_text))
+    return "\n".join(row_lines)
+
+
+def _iter_docx_block_text(document: _DocxDocument):
+    """Yield the text of a Word document's blocks in reading order.
+
+    python-docx exposes paragraphs and tables as two separate
+    collections, which loses their relative order. To preserve reading
+    order, this helper walks the document body's underlying XML and
+    yields paragraph and table text as each block appears.
+
+    Args:
+        document: A python-docx Document object.
+
+    Yields:
+        Text strings, one per non-empty paragraph and one per table, in
+        the order they appear in the document body.
+    """
+    body = document.element.body
+    for child in body.iterchildren():
+        if child.tag.endswith("}p"):
+            # Wrap the raw XML paragraph element back into a Paragraph so
+            # we can use its convenient .text property.
+            paragraph = Paragraph(child, document)
+            if paragraph.text.strip():
+                yield paragraph.text
+        elif child.tag.endswith("}tbl"):
+            table = Table(child, document)
+            table_text = _table_to_text(table)
+            if table_text.strip():
+                yield table_text
+
+
+def read_docx(file) -> str:
+    """Extract text from a Word document, paragraphs and tables included.
+
+    Paragraphs and tables are read in their real order in the document,
+    so a table's content stays close to the surrounding paragraphs.
+    Text boxes (text held in drawing shapes) are not extracted.
+
+    Args:
+        file: A file-like object for the .docx file.
+
+    Returns:
+        The document's text, with blocks separated by newlines.
+    """
+    document = Document(file)
+    return "\n".join(_iter_docx_block_text(document))
+
+
+def read_pptx(file) -> str:
+    """Extract text from a PowerPoint presentation, tables included.
+
+    For each slide, collects the text of every shape that has a text
+    frame (titles, bullet points, text boxes) and the text of every
+    table cell.
 
     Args:
         file: A file-like object for the .pptx file.
 
     Returns:
-        The collected text, with a space between successive shapes.
+        The collected text. Shapes are separated by spaces; table rows
+        by newlines and cells within a row by tabs.
     """
     text_parts = []
     presentation = Presentation(file)
     for slide in presentation.slides:
         for shape in slide.shapes:
-            if hasattr(shape, "text"):
+            if shape.has_table:
+                table = shape.table
+                for row in table.rows:
+                    cells_text = [cell.text.strip() for cell in row.cells]
+                    text_parts.append("\t".join(cells_text))
+            elif shape.has_text_frame:
                 text_parts.append(shape.text)
     return " ".join(text_parts)
 
@@ -118,22 +206,6 @@ def read_excel(file) -> str:
             for cell in row:
                 text_parts.append(str(cell))
     return " ".join(text_parts)
-
-
-def read_docx(file) -> str:
-    """Extract text from a Word document.
-
-    Collects the text of every paragraph. Tables and text boxes are not
-    extracted by this simple reader.
-
-    Args:
-        file: A file-like object for the .docx file.
-
-    Returns:
-        The document's paragraph text, joined by spaces.
-    """
-    document = Document(file)
-    return " ".join(paragraph.text for paragraph in document.paragraphs)
 
 
 # ---------------------------------------------------------------------------
