@@ -40,12 +40,16 @@ class ModelSpec:
             later without changing the registry's structure.
         description: Short English text for the sidebar explaining the
             quality level and relative cost of the model. Written for
-            end users, not developers.
+            end users, not developers. Kept generic (not specific to
+            translation) so it reads well in every view that shows it.
         default_temperature: Temperature used when the caller does not
-            specify one. Translation work favours low values.
+            specify one. Lower values favour safe, consistent output.
         default_max_tokens: Maximum number of output tokens used when
             the caller does not specify a value. Sized generously
-            because translations can be as long as their source text.
+            because a translation can be as long as its source text.
+        supports_temperature: Whether the model accepts a temperature
+            parameter. Some models reject it; when this is False, the
+            LLM gateway omits temperature from the request entirely.
     """
 
     api_id: str
@@ -54,6 +58,7 @@ class ModelSpec:
     description: str
     default_temperature: float
     default_max_tokens: int
+    supports_temperature: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -66,10 +71,9 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         display_name="Claude Haiku 4.5",
         provider="anthropic",
         description=(
-            "Fast and nearly free. Good for straightforward sentences, "
-            "common phrases and internal drafts. For documents that will "
-            "be shared externally, an upgrade with a higher tier is "
-            "recommended."
+            "Fast and nearly free. Good for simple, everyday text and "
+            "internal use. For anything shared externally, a higher tier "
+            "is recommended."
         ),
         default_temperature=0.2,
         default_max_tokens=8192,
@@ -79,9 +83,9 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         display_name="Claude Sonnet 4.6",
         provider="anthropic",
         description=(
-            "High-quality translations at a moderate cost (roughly 3x the "
-            "economy tier). Handles nuance, tone and idiomatic phrasing "
-            "well. Recommended default for most documents."
+            "High quality at a moderate cost (about 3x the economy tier). "
+            "Strong on nuance, tone and natural phrasing. Recommended "
+            "default for most work."
         ),
         default_temperature=0.3,
         default_max_tokens=16384,
@@ -91,12 +95,15 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         display_name="Claude Opus 4.8",
         provider="anthropic",
         description=(
-            "Best quality, highest cost (roughly 5x the standard tier). "
-            "Use for publication-ready texts, sensitive communication and "
-            "the refinement step. Slower than the other tiers."
+            "Top quality at the highest cost (about 5x the standard tier). "
+            "Best for demanding work and for refining results. Slower than "
+            "the other tiers."
         ),
         default_temperature=0.4,
         default_max_tokens=16384,
+        # Opus 4.8 rejects the temperature parameter, so the gateway must
+        # omit it for this model.
+        supports_temperature=False,
     ),
 }
 
@@ -121,15 +128,17 @@ ROLE_TO_MODEL: dict[str, str] = {
 }
 
 # Roles each view offers in its own model selector, in display order.
-# The selectors are CONTEXTUAL: translation and chatbot expose different
-# tiers, because the same role does not mean the same thing in both.
-# "utility" is never user-selectable (internal plumbing), and "premium"
-# is excluded from the translation selector because, for translation, the
-# premium tier is reached through the automatic upgrade step, not chosen
-# up front.
+# The selectors are CONTEXTUAL: translation and chatbot can expose
+# different tiers, because the same role does not mean the same thing in
+# both. "utility" is never user-selectable (internal plumbing).
+#
+# Note: the translation "Upgrade" button always uses the "premium" role,
+# regardless of which model is selected here. Offering "premium" in the
+# translation selector simply lets the user also run the FIRST-PASS
+# translation with the top model.
 #
 # To change which tiers a view offers, edit only the relevant list here.
-TRANSLATION_SELECTABLE_ROLES: list[str] = ["economy", "standard"]
+TRANSLATION_SELECTABLE_ROLES: list[str] = ["economy", "standard", "premium"]
 CHATBOT_SELECTABLE_ROLES: list[str] = ["standard", "premium"]
 
 
