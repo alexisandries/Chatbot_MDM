@@ -22,6 +22,11 @@ The two views always appear in the sidebar, so the user can switch
 between them at any time. Switching pages reruns the script but preserves
 session_state, so a translation in progress or a chat history is never
 lost by navigating.
+
+Each page is given an explicit url_path. This is required because both
+view entry points are named render(); without distinct url_paths,
+Streamlit would infer the same URL pathname from the callable name for
+both pages and refuse to build the navigation.
 """
 
 import streamlit as st
@@ -42,8 +47,19 @@ def main() -> None:
     init_session_state()
 
     pages = [
-        st.Page(translation_view.render, title="Translation", icon="🌐"),
-        st.Page(chatbot_view.render, title="Chatbot", icon="💬"),
+        st.Page(
+            translation_view.render,
+            title="Translation",
+            icon="🌐",
+            url_path="translation",
+            default=True,
+        ),
+        st.Page(
+            chatbot_view.render,
+            title="Chatbot",
+            icon="💬",
+            url_path="chatbot",
+        ),
     ]
     navigation = st.navigation(pages)
 
