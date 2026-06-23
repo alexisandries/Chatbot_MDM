@@ -1,24 +1,134 @@
 """Single gateway for every LLM call made by the application.
 
-All other modules (translation UI, chatbot UI, glossary checker, ...)
-must go through the functions defined here - never through the
-`anthropic` SDK directly. This guarantees three things:
+PURPOSE AND ROLE IN THE ARCHITECTURE
+=====================================
+This module is the ONLY place in the codebase that touches the Anthropic
+SDK. All other modules — translation UI, chatbot UI, glossary checker,
+future refinement pipelines — import from here and never instantiate an
+`anthropic.Anthropic` client themselves.
 
-1. Models are always resolved through their ROLE (see models_config.py),
-   so model upgrades never require touching feature code.
-2. Error handling and API-key management live in exactly one place.
-3. Adding a second provider later (e.g. Mistral) only means extending
-   the dispatch inside this module; callers will not notice.
+That constraint buys three concrete benefits:
 
-Public API:
-    complete(...)       -> str            One-shot completion.
-    complete_json(...)  -> dict | list    Completion parsed as JSON.
-    stream(...)         -> Iterator[str]  Streaming completion (chatbot).
-    LLMError                              Exception raised on any failure.
+  1. Model resolution by role, never by hard-coded string.
+     Callers ask for role="standard" or role="utility". The actual API
+     model string (e.g. "claude-sonnet-4-6") is resolved through
+     models_config.py. When Anthropic releases a new model and we want
+     to upgrade a tier, we change one line in models_config.py and
+     nothing else in the application changes.
 
-Secrets:
-    The Anthropic API key is read from st.secrets["ANTHROPIC_API_KEY"].
-    See secrets.toml.example for the expected structure.
+  2. Centralised error handling.
+     Every exception that the Anthropic SDK can raise — authentication
+     failures, rate limits, transient network errors, empty responses —
+     is caught here and re-raised as LLMError with a message that is
+     safe and meaningful to show directly in the UI via st.error(). No
+     try/except blocks are scattered through feature code.
+
+  3. Provider abstraction.
+     The `provider` field in ModelSpec and the guard in _resolve() are
+     the hooks for adding Mistral (or any other provider) later. The
+     change will be: add the new SDK import, add a branch in complete()
+     and stream(), extend the guard. Callers will not notice.
+
+
+PUBLIC API SUMMARY
+==================
+Three functions and one exception class form the public contract:
+
+  complete(role, system, prompt=..., messages=..., ...)  -> str
+      Non-streaming, one-shot completion. Use for translation and any
+      task where the full answer must be assembled before display.
+      Accepts either a single `prompt` string or a `messages` list, but
+      not both (enforced by _normalize_messages).
+
+  complete_json(role, system, prompt, ...)  -> dict | list
+      Thin wrapper around complete() that strips Markdown code fences
+      and parses the response as JSON. Designed for internal machinery
+      (glossary term detection) that needs structured output. Callers
+      must ask for JSON-only output in their system prompt; this
+      function adds resilience on top of that.
+
+  stream(role, system, messages, ...)  -> Iterator[str]
+      Streaming completion; yields text fragments in order. Intended for
+      the chatbot interface: pass the return value directly to
+      st.write_stream() so the user sees the answer build up in real
+      time. Because this is a generator, exceptions surface when the
+      iterator is consumed, not when stream() is called.
+
+  LLMError(Exception)
+      Raised by all three functions on any failure. The message string
+      is always human-readable and safe to pass to st.error(). It never
+      leaks the API key or raw SDK internals.
+
+
+PRIVATE HELPERS (not for import)
+=================================
+  _get_anthropic_client()   Reads the API key from st.secrets and
+                            returns a cached SDK client (@cache_resource
+                            ensures a single instance per process across
+                            all Streamlit reruns).
+
+  _resolve(role)            Maps a role string to a ModelSpec via
+                            models_config.get_model_for_role(), then
+                            verifies the provider is supported. Raises
+                            LLMError (not KeyError) so callers always
+                            deal with a single exception type.
+
+  _normalize_messages()     Enforces the prompt-XOR-messages contract
+                            and converts a bare prompt string into the
+                            list format the Anthropic Messages API
+                            expects.
+
+
+HOW TO CALL THIS MODULE — QUICK EXAMPLES
+=========================================
+One-shot translation (most common case):
+
+    from llm_client import complete, LLMError
+
+    try:
+        result = complete(
+            role="standard",
+            system="You are a professional translator...",
+            prompt="Translate the following text: ...",
+        )
+    except LLMError as exc:
+        st.error(str(exc))
+
+Structured glossary check:
+
+    from llm_client import complete_json, LLMError
+
+    try:
+        data = complete_json(
+            role="utility",
+            system="Return only a JSON object with a 'matches' key...",
+            prompt=f"Source text: {text}\nGlossary: {glossary}",
+        )
+        matches = data.get("matches", [])
+    except LLMError as exc:
+        st.error(str(exc))
+
+Streaming chatbot response:
+
+    from llm_client import stream, LLMError
+
+    try:
+        with st.chat_message("assistant"):
+            response = st.write_stream(
+                stream(role="standard", system=SYSTEM, messages=history)
+            )
+    except LLMError as exc:
+        st.error(str(exc))
+
+
+SECRETS
+=======
+The Anthropic API key is read exclusively from:
+    st.secrets["ANTHROPIC_API_KEY"]
+
+Add it to .streamlit/secrets.toml (see secrets.toml.example). The key
+is never logged, never included in error messages, and never passed
+through function arguments.
 """
 
 import json
@@ -164,20 +274,22 @@ def complete(
     """
     spec = _resolve(role)
     client = _get_anthropic_client()
-    try:
-        response = client.messages.create(
-            model=spec.api_id,
-            system=system,
-            messages=_normalize_messages(prompt, messages),
-            temperature=(
-                temperature if temperature is not None
-                else spec.default_temperature
-            ),
-            max_tokens=(
-                max_tokens if max_tokens is not None
-                else spec.default_max_tokens
-            ),
+    params = {
+        "model": spec.api_id,
+        "system": system,
+        "messages": _normalize_messages(prompt, messages),
+        "max_tokens": (
+            max_tokens if max_tokens is not None else spec.default_max_tokens
+        ),
+    }
+    # Only send temperature to models that accept it; some models reject
+    # the parameter outright.
+    if spec.supports_temperature:
+        params["temperature"] = (
+            temperature if temperature is not None else spec.default_temperature
         )
+    try:
+        response = client.messages.create(**params)
     except anthropic.AuthenticationError as exc:
         raise LLMError(
             "Authentication with the Anthropic API failed. "
@@ -286,20 +398,20 @@ def stream(
     """
     spec = _resolve(role)
     client = _get_anthropic_client()
+    params = {
+        "model": spec.api_id,
+        "system": system,
+        "messages": _normalize_messages(None, messages),
+        "max_tokens": (
+            max_tokens if max_tokens is not None else spec.default_max_tokens
+        ),
+    }
+    if spec.supports_temperature:
+        params["temperature"] = (
+            temperature if temperature is not None else spec.default_temperature
+        )
     try:
-        with client.messages.stream(
-            model=spec.api_id,
-            system=system,
-            messages=_normalize_messages(None, messages),
-            temperature=(
-                temperature if temperature is not None
-                else spec.default_temperature
-            ),
-            max_tokens=(
-                max_tokens if max_tokens is not None
-                else spec.default_max_tokens
-            ),
-        ) as event_stream:
+        with client.messages.stream(**params) as event_stream:
             yield from event_stream.text_stream
     except anthropic.AuthenticationError as exc:
         raise LLMError(
