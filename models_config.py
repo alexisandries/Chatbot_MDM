@@ -120,9 +120,17 @@ ROLE_TO_MODEL: dict[str, str] = {
     "utility": "haiku",
 }
 
-# Roles the user can pick from in the sidebar model selector, in display
-# order. "utility" is deliberately excluded: it is internal plumbing.
-USER_SELECTABLE_ROLES: list[str] = ["economy", "standard", "premium"]
+# Roles each view offers in its own model selector, in display order.
+# The selectors are CONTEXTUAL: translation and chatbot expose different
+# tiers, because the same role does not mean the same thing in both.
+# "utility" is never user-selectable (internal plumbing), and "premium"
+# is excluded from the translation selector because, for translation, the
+# premium tier is reached through the automatic upgrade step, not chosen
+# up front.
+#
+# To change which tiers a view offers, edit only the relevant list here.
+TRANSLATION_SELECTABLE_ROLES: list[str] = ["economy", "standard"]
+CHATBOT_SELECTABLE_ROLES: list[str] = ["standard", "premium"]
 
 
 # ---------------------------------------------------------------------------
@@ -159,12 +167,39 @@ def get_model_for_role(role: str) -> ModelSpec:
     return MODEL_REGISTRY[model_key]
 
 
-def get_selectable_models() -> dict[str, ModelSpec]:
-    """Return the models offered in the sidebar selector.
+def _models_for_roles(roles: list[str]) -> dict[str, ModelSpec]:
+    """Build an ordered {role: ModelSpec} mapping for a list of roles.
+
+    Args:
+        roles: The roles to include, in the desired display order.
 
     Returns:
-        An ordered mapping {role: ModelSpec} restricted to the roles in
-        USER_SELECTABLE_ROLES. The UI iterates over this mapping to
-        build the radio buttons and their quality/cost descriptions.
+        An ordered mapping from each role to its ModelSpec.
+
+    Raises:
+        KeyError: If any role is unknown or points to a missing model
+            (propagated from get_model_for_role).
     """
-    return {role: get_model_for_role(role) for role in USER_SELECTABLE_ROLES}
+    return {role: get_model_for_role(role) for role in roles}
+
+
+def get_translation_models() -> dict[str, ModelSpec]:
+    """Return the models offered in the Translation view's selector.
+
+    Returns:
+        An ordered mapping {role: ModelSpec} for the translation tiers.
+        The UI iterates over it to build the radio buttons and their
+        quality/cost descriptions.
+    """
+    return _models_for_roles(TRANSLATION_SELECTABLE_ROLES)
+
+
+def get_chatbot_models() -> dict[str, ModelSpec]:
+    """Return the models offered in the Chatbot view's selector.
+
+    Returns:
+        An ordered mapping {role: ModelSpec} for the chatbot tiers. The
+        UI iterates over it to build the radio buttons and their
+        quality/cost descriptions.
+    """
+    return _models_for_roles(CHATBOT_SELECTABLE_ROLES)
