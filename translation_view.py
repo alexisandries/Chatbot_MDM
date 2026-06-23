@@ -240,6 +240,10 @@ def render() -> None:
 
         # --- Upgrade ---
         st.markdown("**Upgrade this translation** ✨")
+        st.caption(
+            "The upgrade always uses Claude Opus 4.8 (premium), whichever "
+            "model is selected on the left."
+        )
         feedback = st.text_input(
             "Your feedback or guidelines (optional)", key="translation_feedback"
         )
