@@ -41,8 +41,12 @@ _DEFAULTS: dict = {
     "translation_raw": "",                  # base translation text
     "translation_refined": "",              # upgraded translation text
     "translation_glossary_instructions": "",  # glossary block reused on upgrade
+    "translation_source_text": "",          # the source text that was translated
     "translation_source_code": "",          # detected source ISO code
     "translation_source_name": "",          # detected source language name
+    "translation_target_code": "",          # target ISO code used for the translation
+    "translation_compliance": [],           # glossary discrepancies in the base translation
+    "translation_refined_compliance": [],   # glossary discrepancies in the refined translation
     # Chatbot view.
     "chat_messages": [],                    # list of {"role", "content"} dicts
 }
