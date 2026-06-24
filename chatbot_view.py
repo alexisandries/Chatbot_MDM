@@ -45,6 +45,34 @@ from session import select_chatbot_model
 _DOCUMENTS_ACK = "Understood. I'll use these documents as needed."
 
 
+# Concise usage guide shown in an expander under the header. Expanded on
+# an empty conversation (onboarding), collapsed once chatting.
+_USAGE_GUIDE = """\
+A conversational assistant powered by Claude. A few tips to get the most out of it:
+
+- **Model** (sidebar) — Sonnet is the balanced default; switch to Opus for the hardest questions (slower, higher cost).
+- **Web search** (sidebar) — keep it on for current events or facts that may have changed; turn it off to save cost on offline tasks.
+- **Reasoning** (sidebar) — raise the level for complex, multi-step problems; the assistant thinks more before answering, at higher cost and latency.
+- **Attach to one message** (paperclip in the message box) — the file is used for that message only.
+- **Conversation documents** (sidebar) — upload a reference document to ask several questions about; it stays available for the whole conversation and is cached to limit cost.
+- **File types** — images and PDFs are read in full, including visuals; Office files are read as text only (convert to PDF if their images matter).
+- **Copy** any answer with the 📋 button; **New conversation** (sidebar) clears the chat and its documents.
+"""
+
+
+def _render_help() -> None:
+    """Show the usage guide, expanded only when the conversation is empty.
+
+    New users (empty conversation) see the guide expanded; once they start
+    chatting it collapses but stays accessible.
+    """
+    with st.expander(
+        "ℹ️ How to use this chatbot",
+        expanded=not st.session_state.chat_messages,
+    ):
+        st.markdown(_USAGE_GUIDE)
+
+
 def _render_sidebar_controls() -> tuple[bool, str, list]:
     """Render the chatbot's sidebar controls and return the user choices.
 
@@ -270,12 +298,7 @@ def render() -> None:
     )
 
     st.header("Chatbot")
-    st.caption(
-        "📎 Attachments: images and PDFs are read in full, including their "
-        "visuals. Office files (Word, PowerPoint, Excel) can be attached too, "
-        "but only their text is read — embedded images are not. If a document's "
-        "visuals matter, convert it to PDF first."
-    )
+    _render_help()
 
     _render_history()
 
