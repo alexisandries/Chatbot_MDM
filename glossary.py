@@ -312,6 +312,58 @@ def format_terminology_for_prompt(
     return "\n".join(lines)
 
 
+def format_full_glossary_for_prompt(target_language: str) -> str:
+    """Format the entire glossary as binding target-language guidance.
+
+    Used when the source is not available as plain text (for example a
+    document read natively as a PDF or image), so terms cannot be detected
+    in the source in advance. Instead of detecting specific terms, the
+    whole glossary is supplied: for every concept that has an official
+    term in the target language, the model is told to use that term
+    whenever the document expresses the concept, in whatever source
+    language. The other languages' forms are given as context so the model
+    can recognise the concept.
+
+    Args:
+        target_language: ISO code of the target language ("fr", "nl",
+            "en").
+
+    Returns:
+        A binding instruction block. If the target language has no
+        official terms in the glossary, returns a short neutral note so
+        the caller can embed the result unconditionally.
+    """
+    lines: list[str] = []
+    for entry in GLOSSARY_DATA:
+        target_term = entry.get(target_language, "")
+        if not target_term:
+            continue
+        other_forms = []
+        for code, value in entry.items():
+            if code != target_language and value and value not in other_forms:
+                other_forms.append(value)
+        context = "; ".join(other_forms) if other_forms else "(no other forms)"
+        lines.append(
+            f"- Use '{target_term}' for the concept also expressed as: {context}."
+        )
+
+    if not lines:
+        return (
+            "No specific glossary terminology applies for this target "
+            "language. Translate using standard professional terminology."
+        )
+
+    header = [
+        "INSTITUTIONAL TERMINOLOGY (BINDING).",
+        "These are the organisation's official terms in the target language. "
+        "Whenever the document expresses one of these concepts, you MUST use "
+        "the official term below, even if the document uses different or "
+        "deprecated wording. This is a norm, not a suggestion.",
+        "",
+    ]
+    return "\n".join(header + lines)
+
+
 # ---------------------------------------------------------------------------
 # Downstream use: passive compliance check
 # ---------------------------------------------------------------------------
