@@ -156,7 +156,7 @@ def _render_login_page() -> None:
         st.title("🔐 MdM IA Tool")
         st.write(
             "Please enter your credentials to access the application. "
-            "Contact your administrator if you do not have access."
+            "Contact marketing (Alexis) if you do not have access."
         )
         st.divider()
 
