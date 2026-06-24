@@ -49,6 +49,7 @@ _DEFAULTS: dict = {
     "translation_refined_compliance": [],   # glossary discrepancies in the refined translation
     # Chatbot view.
     "chat_messages": [],                    # list of {"role", "content"} dicts
+    "chat_docs_nonce": 0,                   # bumped to reset the document uploader
 }
 
 
