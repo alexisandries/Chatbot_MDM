@@ -142,8 +142,90 @@ Translate the text in <source_text> according to your instructions.
 
 
 # ---------------------------------------------------------------------------
-# Upgrade / refinement
+# Native document translation (PDF / image read directly)
 # ---------------------------------------------------------------------------
+
+def build_native_translation_system_prompt(target_language: str) -> str:
+    """Build the system prompt for translating a document read natively.
+
+    Used when a PDF or image is sent to the model directly (not extracted
+    to plain text first). The model sees the document's layout, so the
+    prompt asks it to produce clean text: ignore layout artefacts, follow
+    the correct reading order, translate text found inside visuals with a
+    consistent marker, and apply the institutional glossary.
+
+    Args:
+        target_language: Human-readable target language name (e.g.
+            "Dutch").
+
+    Returns:
+        The system prompt string.
+    """
+    return f"""\
+You are a senior professional translator with native-level command of \
+{target_language}. You receive a document (PDF or image) and translate its \
+content into {target_language}, producing clean, publication-quality text \
+that reads as if written directly in {target_language}.
+
+Follow these rules, in order of priority:
+
+1. INSTITUTIONAL TERMINOLOGY OVERRIDES THE SOURCE.
+   If a glossary is supplied, its terms are a binding institutional norm. \
+Use the official {target_language} term even when the document uses a \
+different or deprecated wording. The glossary corrects the source; it is \
+never optional.
+
+2. CLEAN, NOT RAW.
+   Translate only the meaningful body content. Ignore layout artefacts: \
+repeated running headers and footers, page numbers, and stray fragments. \
+Follow the correct reading order even when the document uses columns, boxes \
+or multiple sections.
+
+3. TEXT INSIDE VISUALS.
+   When meaningful text appears inside an image, chart, diagram or \
+infographic, translate it and prefix that text with "[Image: ...]" so the \
+reader can tell it came from a visual element. Do not describe the visual \
+itself; only translate the text it contains.
+
+4. NO STRUCTURAL CALQUES.
+   Do not mirror the document's sentence structure or word order. Write as a \
+native {target_language} author would, using natural idioms and \
+collocations.
+
+5. FIDELITY.
+   Convey exactly what the document says. Preserve its tone and register. \
+Do not add or omit ideas.
+
+6. LAYOUT.
+   Organise the output as clean {target_language} text — paragraphs, \
+headings and lists as appropriate — for easy reading.
+
+Output only the final {target_language} translation. No preamble, no notes, \
+no explanation.
+"""
+
+
+def build_native_translation_user_text(glossary_instructions: str) -> str:
+    """Build the text block that accompanies a native document translation.
+
+    This text is placed after the document's content blocks in the user
+    message. It carries the glossary instructions; the document itself is
+    supplied as image/PDF blocks, not as text.
+
+    Args:
+        glossary_instructions: The instruction block from
+            glossary.format_full_glossary_for_prompt().
+
+    Returns:
+        The user text-block string.
+    """
+    return f"""\
+Translate the attached document according to your instructions.
+
+<glossary>
+{glossary_instructions}
+</glossary>
+"""
 
 def build_upgrade_system_prompt(target_language: str) -> str:
     """Build the system prompt for upgrading an existing translation.
