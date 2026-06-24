@@ -65,6 +65,22 @@ class AttachmentError(Exception):
     """
 
 
+def is_native_type(mime_type: str) -> bool:
+    """Return whether a file type is read natively (image or PDF).
+
+    Native types are sent to the model as-is, so it sees their visual
+    layout. Other supported types (Office files) are read as extracted
+    text instead.
+
+    Args:
+        mime_type: The file's MIME type.
+
+    Returns:
+        True for images and PDF, False otherwise.
+    """
+    return mime_type in _IMAGE_MIME_TYPES or mime_type == _PDF_MIME_TYPE
+
+
 def _encode_base64(data: bytes) -> str:
     """Return the standard base64 encoding of bytes as an ASCII string."""
     return base64.standard_b64encode(data).decode("utf-8")
