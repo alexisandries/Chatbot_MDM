@@ -44,6 +44,9 @@ separately so the view can flag any remaining discrepancy to the user.
 
 from dataclasses import dataclass
 
+import fitz  # PyMuPDF, used to count PDF pages
+
+import attachments
 import chunking
 import glossary
 import language
@@ -67,13 +70,29 @@ UPGRADE_MAX_CHARS = 40000
 # cost before translating. Purely advisory; nothing is blocked.
 TOKEN_WARNING_THRESHOLD = 30000
 
+# Maximum number of pages in a PDF translated natively in one request,
+# matching the Anthropic API's per-request document limit.
+MAX_DOCUMENT_PAGES = 100
+
 # Rough characters-per-token ratio for European languages. Used only for
 # the advisory estimate, never for billing or hard limits.
 _CHARS_PER_TOKEN = 4
 
+# Rough token cost of a natively-read PDF page and image, for the advisory
+# estimate only.
+_PDF_TOKENS_PER_PAGE = 2000
+_IMAGE_TOKENS = 1600
+
 # Placeholder inserted when the user upgrades without typing any feedback,
 # so the upgrade prompt always has a consistent structure.
 _NO_FEEDBACK_PLACEHOLDER = "(no specific feedback provided)"
+
+# Placeholder used as the "source" when upgrading a translation that was
+# produced from a natively-read document (no plain-text source exists).
+_NO_SOURCE_PLACEHOLDER = (
+    "(The source was a document read directly, so no plain-text source is "
+    "available. Focus on improving quality and applying the glossary.)"
+)
 
 
 class TranslationError(Exception):
@@ -231,6 +250,127 @@ def translate_text(
 
 
 # ---------------------------------------------------------------------------
+# Native document translation (PDF / image)
+# ---------------------------------------------------------------------------
+
+def _pdf_page_count(uploaded_file) -> int:
+    """Return the number of pages in an uploaded PDF.
+
+    Args:
+        uploaded_file: The uploaded PDF (exposes .getvalue()).
+
+    Returns:
+        The page count, or 0 if the PDF cannot be read.
+    """
+    try:
+        with fitz.open(stream=uploaded_file.getvalue(), filetype="pdf") as doc:
+            return doc.page_count
+    except Exception:
+        return 0
+
+
+def estimate_document_tokens(files) -> int:
+    """Estimate the input token cost of natively translating documents.
+
+    For PDFs the estimate is based on the page count; for images, a flat
+    per-image figure. This is a coarse, advisory figure used only to warn
+    about cost in the UI, never for billing.
+
+    Args:
+        files: The uploaded PDF/image files to be translated natively.
+
+    Returns:
+        An approximate token count (always >= 0).
+    """
+    total = 0
+    for uploaded_file in files:
+        if uploaded_file.type == "application/pdf":
+            pages = _pdf_page_count(uploaded_file) or 1
+            total += pages * _PDF_TOKENS_PER_PAGE
+        else:
+            total += _IMAGE_TOKENS
+    return total
+
+
+def translate_document(
+    files,
+    target_language_code: str,
+    role: str,
+) -> TranslationResult:
+    """Translate a PDF or image document read natively into clean text.
+
+    The document is sent to the model as-is (not extracted to text first),
+    so the model sees its layout and can drop artefacts, follow the correct
+    reading order, and translate text embedded in visuals. The full
+    glossary is injected as binding guidance, since there is no extracted
+    source text in which to detect terms beforehand.
+
+    Args:
+        files: The uploaded PDF/image files to translate (usually one).
+        target_language_code: ISO code of the target language.
+        role: The model role to translate with ("economy", "standard" or
+            "premium").
+
+    Returns:
+        A TranslationResult. Its source_language_code is empty (the source
+        language is not detected for native documents) and its
+        source_language_name is "Document".
+
+    Raises:
+        TranslationError: If there is no document, if a PDF exceeds the
+            page limit, or if the LLM call fails. The message is suitable
+            for display to the user.
+    """
+    if not files:
+        raise TranslationError("There is no document to translate.")
+
+    for uploaded_file in files:
+        if uploaded_file.type == "application/pdf":
+            pages = _pdf_page_count(uploaded_file)
+            if pages > MAX_DOCUMENT_PAGES:
+                raise TranslationError(
+                    f"This PDF has {pages} pages; the maximum for a single "
+                    f"translation is {MAX_DOCUMENT_PAGES}. Please split it "
+                    "into smaller files."
+                )
+
+    target_name = language.language_name(target_language_code)
+    glossary_instructions = glossary.format_full_glossary_for_prompt(
+        target_language_code
+    )
+
+    try:
+        document_blocks, _labels = attachments.build_attachment_blocks(files)
+    except attachments.AttachmentError as exc:
+        raise TranslationError(str(exc)) from exc
+
+    system_prompt = translation_prompts.build_native_translation_system_prompt(
+        target_name
+    )
+    user_text = translation_prompts.build_native_translation_user_text(
+        glossary_instructions
+    )
+    content = list(document_blocks)
+    content.append({"type": "text", "text": user_text})
+
+    try:
+        text = llm_client.complete(
+            role=role,
+            system=system_prompt,
+            messages=[{"role": "user", "content": content}],
+        )
+    except llm_client.LLMError as exc:
+        raise TranslationError(str(exc)) from exc
+
+    return TranslationResult(
+        text=text,
+        glossary_instructions=glossary_instructions,
+        source_language_code="",
+        source_language_name="Document",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Upgrade / refinement
 # ---------------------------------------------------------------------------
 
@@ -289,13 +429,18 @@ def upgrade_translation(
             source_text, source_language_code, target_language_code
         )
 
+    # A translation produced from a natively-read document has no
+    # plain-text source. Substitute a placeholder so the editor focuses on
+    # quality and terminology rather than a source it cannot see.
+    source_for_prompt = source_text if source_text and source_text.strip() else _NO_SOURCE_PLACEHOLDER
+
     feedback = user_feedback.strip() if user_feedback else ""
     if not feedback:
         feedback = _NO_FEEDBACK_PLACEHOLDER
 
     system_prompt = translation_prompts.build_upgrade_system_prompt(target_name)
     user_prompt = translation_prompts.build_upgrade_user_prompt(
-        source_text, current_translation, feedback, glossary_instructions
+        source_for_prompt, current_translation, feedback, glossary_instructions
     )
 
     try:
