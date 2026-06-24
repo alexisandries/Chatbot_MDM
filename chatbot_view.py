@@ -2,17 +2,29 @@
 
 This module renders a chat interface in the style of consumer LLM apps:
 a running conversation history, streamed responses, an easy way to copy
-any answer, and a button to start a new conversation. It also exposes two
-capabilities in the sidebar: web search and an extended-thinking level.
-It holds the UI only; the model call goes through the LLM gateway.
+any answer, file attachments, and a button to start a new conversation.
+It also exposes two capabilities in the sidebar: web search and an
+extended-thinking level. It holds the UI only; the model call goes
+through the LLM gateway.
 
-The whole conversation is kept in session_state under "chat_messages" as
-a list of {"role": "user"|"assistant", "content": str} dicts, which is
-exactly the format the LLM gateway expects.
+ATTACHMENTS (current-message scope)
+===================================
+Files attached in the chat input apply to the message they are sent with
+only. They are sent to the model with that single turn and are NOT
+re-sent on later turns: afterwards the conversation keeps just a short
+"📎 filename" trace. This keeps follow-up turns cheap, since a large PDF
+or image is never re-transmitted. The model's own answer remains in the
+history, so the thread stays coherent without resending the file.
+
+The conversation is stored in session_state under "chat_messages" as a
+list of {"role", "content": str} dicts. Stored content is always the
+lightweight text (never the heavy file data); the file blocks exist only
+transiently, while the message that carries them is being sent.
 """
 
 import streamlit as st
 
+import attachments
 import llm_client
 import tools_config
 from chatbot_prompts import build_chatbot_system_prompt
@@ -86,24 +98,67 @@ def _render_history() -> None:
                 st.markdown(message["content"])
 
 
+def _build_display_text(text: str, labels: list[str]) -> str:
+    """Build the lightweight text stored and shown for a user turn.
+
+    Combines the typed text with a short note listing any attached files.
+
+    Args:
+        text: The text the user typed (may be empty).
+        labels: File names attached to this message (may be empty).
+
+    Returns:
+        The text to display and persist for this turn.
+    """
+    if not labels:
+        return text
+    note = "📎 " + ", ".join(labels)
+    return f"{text}\n\n{note}" if text else note
+
+
 def _handle_new_message(
-    prompt: str,
+    text: str,
+    files: list,
     role: str,
     tools: list[dict],
     thinking_budget: int | None,
 ) -> None:
-    """Append the user's message, stream the reply, and store both.
+    """Send a user message (with optional attachments) and store the turn.
+
+    Attachments are sent with this turn only; the stored history keeps a
+    lightweight trace instead of the file data.
 
     Args:
-        prompt: The text the user just submitted.
-        role: The model role to answer with (from the sidebar selector).
+        text: The text the user typed (may be empty if only files sent).
+        files: Files attached to this message (may be empty).
+        role: The model role to answer with.
         tools: Server tools to enable for this turn (may be empty).
-        thinking_budget: Extended-thinking token budget, or None to
-            disable thinking.
+        thinking_budget: Extended-thinking token budget, or None.
     """
-    st.session_state.chat_messages.append({"role": "user", "content": prompt})
+    # Convert attachments to content blocks for this turn only.
+    attachment_blocks: list[dict] = []
+    labels: list[str] = []
+    if files:
+        try:
+            attachment_blocks, labels = attachments.build_attachment_blocks(files)
+        except attachments.AttachmentError as exc:
+            st.error(str(exc))
+            return
+
+    # Content actually sent to the model: attachments first, then text.
+    api_content: list[dict] = list(attachment_blocks)
+    if text:
+        api_content.append({"type": "text", "text": text})
+    if not api_content:
+        return  # nothing to send
+
+    display_text = _build_display_text(text, labels)
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(display_text)
+
+    # Prior (lightweight) history plus this turn's full content.
+    api_messages = list(st.session_state.chat_messages)
+    api_messages.append({"role": "user", "content": api_content})
 
     with st.chat_message("assistant"):
         try:
@@ -111,18 +166,19 @@ def _handle_new_message(
                 llm_client.stream(
                     role=role,
                     system=build_chatbot_system_prompt(),
-                    messages=st.session_state.chat_messages,
+                    messages=api_messages,
                     tools=tools,
                     thinking_budget=thinking_budget,
                 )
             )
         except llm_client.LLMError as exc:
             st.error(str(exc))
-            # Drop the user turn that produced no answer, so a retry does
-            # not resend a dangling message.
-            st.session_state.chat_messages.pop()
             return
 
+    # Persist only the lightweight versions (no heavy file data re-sent).
+    st.session_state.chat_messages.append(
+        {"role": "user", "content": display_text}
+    )
     st.session_state.chat_messages.append(
         {"role": "assistant", "content": response}
     )
@@ -140,10 +196,17 @@ def render() -> None:
 
     _render_history()
 
-    prompt = st.chat_input("Type your message")
-    if prompt:
+    submission = st.chat_input(
+        "Type your message (and attach files if needed)",
+        accept_file="multiple",
+        file_type=attachments.ALLOWED_EXTENSIONS,
+        key="chat_input",
+    )
+    if submission and (submission.text or submission.files):
         tools = tools_config.build_chatbot_tools(
             web_search_enabled=web_search_enabled
         )
         budget = tools_config.thinking_budget(thinking_level)
-        _handle_new_message(prompt, role, tools, budget)
+        _handle_new_message(
+            submission.text or "", submission.files, role, tools, budget
+        )
