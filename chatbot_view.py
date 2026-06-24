@@ -193,6 +193,12 @@ def render() -> None:
     web_search_enabled, thinking_level = _render_sidebar_controls()
 
     st.header("Chatbot")
+    st.caption(
+        "📎 Attachments: images and PDFs are read in full, including their "
+        "visuals. Office files (Word, PowerPoint, Excel) can be attached too, "
+        "but only their text is read — embedded images are not. If a document's "
+        "visuals matter, convert it to PDF first."
+    )
 
     _render_history()
 
