@@ -98,6 +98,20 @@ def _show_estimate(estimated_tokens: int) -> None:
         st.caption(f"~{estimated_tokens:,} tokens")
 
 
+def _render_copy(text: str) -> None:
+    """Show a copy control for a block of text.
+
+    Mirrors the chatbot's copy affordance: a small popover holding the
+    text in a code block, which Streamlit renders with a built-in
+    one-click copy button.
+
+    Args:
+        text: The text to make copyable.
+    """
+    with st.popover("📋 Copy"):
+        st.code(text, language=None)
+
+
 def _render_compliance(discrepancies: list[dict]) -> None:
     """Show a glossary-compliance warning, if there are any discrepancies.
 
@@ -242,6 +256,7 @@ def _render_results() -> None:
     st.caption(f"Source: {st.session_state.translation_source_name}")
     with st.container(border=True):
         st.write(st.session_state.translation_raw)
+    _render_copy(st.session_state.translation_raw)
     _render_compliance(st.session_state.translation_compliance)
 
     # --- Upgrade ---
@@ -259,6 +274,7 @@ def _render_results() -> None:
     if st.session_state.translation_refined:
         with st.container(border=True):
             st.write(st.session_state.translation_refined)
+        _render_copy(st.session_state.translation_refined)
         _render_compliance(st.session_state.translation_refined_compliance)
 
     # --- Download ---
