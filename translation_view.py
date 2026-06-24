@@ -44,6 +44,30 @@ from session import select_translation_model
 _NAMED_TARGET_LANGUAGES = {"Dutch": "nl", "French": "fr", "English": "en"}
 
 
+def _reset_session() -> None:
+    """Clear all translation content and reset the input widgets.
+
+    Wipes the stored results (base and refined translations, glossary
+    instructions, source, compliance) and bumps the input nonce so the
+    file uploader, text area and feedback field are recreated empty. The
+    target language is intentionally left unchanged: a new session is for
+    a new text, usually in the same working language.
+    """
+    st.session_state.translation_raw = ""
+    st.session_state.translation_refined = ""
+    st.session_state.translation_glossary_instructions = ""
+    st.session_state.translation_source_text = ""
+    st.session_state.translation_source_code = ""
+    st.session_state.translation_source_name = ""
+    st.session_state.translation_target_code = ""
+    st.session_state.translation_compliance = []
+    st.session_state.translation_refined_compliance = []
+    # Changing the nonce gives the input widgets fresh keys, so Streamlit
+    # recreates them empty.
+    st.session_state.translation_input_nonce += 1
+    st.rerun()
+
+
 def _select_target_language() -> str:
     """Render the target-language picker and return the chosen ISO code.
 
@@ -266,7 +290,8 @@ def _render_results() -> None:
         "model is selected on the left."
     )
     feedback = st.text_input(
-        "Your feedback or guidelines (optional)", key="translation_feedback"
+        "Your feedback or guidelines (optional)",
+        key=f"translation_feedback_{st.session_state.translation_input_nonce}",
     )
     if st.button("Upgrade 🚀", type="primary", key="translation_upgrade"):
         _run_upgrade(feedback)
@@ -301,17 +326,24 @@ def render() -> None:
     """
     role = select_translation_model()
 
+    with st.sidebar:
+        if st.button("New session", width="stretch", key="translation_new"):
+            _reset_session()
+
     st.header("Translate your text")
 
     target_code = _select_target_language()
 
+    nonce = st.session_state.translation_input_nonce
     uploaded_file = st.file_uploader(
         "Upload a file (PDF, image, or Office)",
         type=attachments.ALLOWED_EXTENSIONS,
-        key="translation_file",
+        key=f"translation_file_{nonce}",
     )
     manual_text = st.text_area(
-        "Or paste text to translate", height=150, key="translation_manual"
+        "Or paste text to translate",
+        height=150,
+        key=f"translation_manual_{nonce}",
     )
 
     # Decide which path the input takes.
