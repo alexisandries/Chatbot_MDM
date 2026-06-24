@@ -47,6 +47,7 @@ _DEFAULTS: dict = {
     "translation_target_code": "",          # target ISO code used for the translation
     "translation_compliance": [],           # glossary discrepancies in the base translation
     "translation_refined_compliance": [],   # glossary discrepancies in the refined translation
+    "translation_input_nonce": 0,           # bumped to reset the input widgets
     # Chatbot view.
     "chat_messages": [],                    # list of {"role", "content"} dicts
     "chat_docs_nonce": 0,                   # bumped to reset the document uploader
