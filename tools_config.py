@@ -22,7 +22,7 @@ Docs:
 # searches Claude may run per message, which bounds the per-message cost
 # (each search is billed separately, on top of token costs).
 _WEB_SEARCH_TOOL = {
-    "type": "web_search_20260318",
+    "type": "web_search_20260209",
     "name": "web_search",
     "max_uses": 3,
 }
@@ -32,7 +32,7 @@ _WEB_SEARCH_TOOL = {
 # it, pass web_fetch_enabled=True to build_chatbot_tools(); verify the
 # version string and any required beta header against the docs first.
 _WEB_FETCH_TOOL = {
-    "type": "web_fetch_20260318",
+    "type": "web_fetch_20260309",
     "name": "web_fetch",
     "max_uses": 3,
 }
