@@ -370,11 +370,17 @@ def stream(
     messages: list[dict],
     temperature: float | None = None,
     max_tokens: int | None = None,
+    tools: list[dict] | None = None,
+    thinking_budget: int | None = None,
 ) -> Iterator[str]:
     """Run a streaming completion, yielding text chunks as they arrive.
 
     Intended for the chatbot interface, where chunks are fed directly
     to st.write_stream() so the user sees the answer being typed.
+
+    Server-side tools (e.g. web search) and extended thinking can be
+    enabled per call. When thinking is on, the yielded fragments are the
+    final answer only; the model's internal reasoning is not streamed.
 
     Args:
         role: Model role (usually whatever the user picked in the
@@ -383,9 +389,16 @@ def stream(
         messages: Full conversation history as a list of
             {"role": "user"|"assistant", "content": str} dicts.
         temperature: Sampling temperature. Defaults to the model's
-            registry value.
+            registry value. Ignored when thinking is enabled (extended
+            thinking requires the default temperature).
         max_tokens: Output token cap. Defaults to the model's registry
-            value.
+            value. When thinking is enabled, the budget is added on top
+            so the answer still has room.
+        tools: Optional list of tool definitions to enable (e.g. the web
+            search server tool). Pass None or an empty list for none.
+        thinking_budget: Optional number of tokens to allocate to
+            extended thinking. None disables thinking. Must be at least
+            1024 when set.
 
     Yields:
         Text fragments in order. Concatenating all fragments gives the
@@ -398,18 +411,32 @@ def stream(
     """
     spec = _resolve(role)
     client = _get_anthropic_client()
+    effective_max_tokens = (
+        max_tokens if max_tokens is not None else spec.default_max_tokens
+    )
     params = {
         "model": spec.api_id,
         "system": system,
         "messages": _normalize_messages(None, messages),
-        "max_tokens": (
-            max_tokens if max_tokens is not None else spec.default_max_tokens
-        ),
     }
-    if spec.supports_temperature:
-        params["temperature"] = (
-            temperature if temperature is not None else spec.default_temperature
-        )
+    if thinking_budget:
+        # Extended thinking needs room for both the reasoning and the
+        # answer, and it requires the default temperature, so temperature
+        # is deliberately not sent here.
+        params["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": thinking_budget,
+        }
+        params["max_tokens"] = thinking_budget + effective_max_tokens
+    else:
+        params["max_tokens"] = effective_max_tokens
+        if spec.supports_temperature:
+            params["temperature"] = (
+                temperature if temperature is not None
+                else spec.default_temperature
+            )
+    if tools:
+        params["tools"] = tools
     try:
         with client.messages.stream(**params) as event_stream:
             yield from event_stream.text_stream
