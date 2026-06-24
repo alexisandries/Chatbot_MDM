@@ -125,13 +125,22 @@ def _office_text_block(uploaded_file) -> dict:
     }
 
 
-def build_attachment_blocks(uploaded_files) -> tuple[list[dict], list[str]]:
+def build_attachment_blocks(
+    uploaded_files,
+    cache_last_block: bool = False,
+) -> tuple[list[dict], list[str]]:
     """Convert uploaded files into API content blocks and labels.
 
     Args:
         uploaded_files: A list of uploaded files (each exposes .name,
             .type, .size and the usual file-like interface), as returned
-            by st.chat_input(...).files.
+            by st.chat_input(...).files or st.file_uploader(...).
+        cache_last_block: When True, a prompt-cache breakpoint is placed
+            on the last block, so that everything up to and including it
+            (typically the system prompt plus all these document blocks)
+            is cached and reused cheaply on later turns. Use this for
+            conversation-level documents that are re-sent every turn;
+            leave it False for one-off, current-message attachments.
 
     Returns:
         A (blocks, labels) tuple where blocks is the list of content
@@ -159,5 +168,11 @@ def build_attachment_blocks(uploaded_files) -> tuple[list[dict], list[str]]:
                 f"({mime_type})."
             )
         labels.append(uploaded_file.name)
+
+    if cache_last_block and blocks:
+        # Mark a cache breakpoint on the final block. The cached prefix
+        # then covers the system prompt and every document block, so the
+        # heavy document tokens are re-read cheaply on subsequent turns.
+        blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
 
     return blocks, labels
