@@ -3,23 +3,31 @@
 This module renders a chat interface in the style of consumer LLM apps:
 a running conversation history, streamed responses, an easy way to copy
 any answer, file attachments, and a button to start a new conversation.
-It also exposes two capabilities in the sidebar: web search and an
-extended-thinking level. It holds the UI only; the model call goes
-through the LLM gateway.
+It also exposes capabilities in the sidebar: web search, an extended-
+thinking level, and conversation-level documents. It holds the UI only;
+the model call goes through the LLM gateway.
 
-ATTACHMENTS (current-message scope)
-===================================
-Files attached in the chat input apply to the message they are sent with
-only. They are sent to the model with that single turn and are NOT
-re-sent on later turns: afterwards the conversation keeps just a short
-"📎 filename" trace. This keeps follow-up turns cheap, since a large PDF
-or image is never re-transmitted. The model's own answer remains in the
-history, so the thread stays coherent without resending the file.
+TWO WAYS TO ATTACH FILES
+========================
+Current-message attachments (chat input)
+    Files attached in the chat input apply to that one message only. They
+    are sent with that single turn and are NOT re-sent afterwards; the
+    history keeps just a short "📎 filename" trace. Cheap for follow-ups.
 
+Conversation documents (sidebar uploader)
+    Files uploaded in the sidebar stay available for the whole
+    conversation. They are re-sent with every turn so the model can keep
+    referring to them, but they are prompt-cached: after the first turn,
+    re-reading them costs a fraction of the normal token price. Best for a
+    reference document the user asks several questions about.
+
+STORED STATE
+============
 The conversation is stored in session_state under "chat_messages" as a
 list of {"role", "content": str} dicts. Stored content is always the
-lightweight text (never the heavy file data); the file blocks exist only
-transiently, while the message that carries them is being sent.
+lightweight text (never heavy file data): current-message attachments are
+reduced to a "📎" trace, and conversation documents live only in the
+sidebar uploader, rebuilt into the request each turn.
 """
 
 import streamlit as st
@@ -31,15 +39,23 @@ from chatbot_prompts import build_chatbot_system_prompt
 from session import select_chatbot_model
 
 
-def _render_sidebar_controls() -> tuple[bool, str]:
+# Synthetic assistant turn placed right after the conversation documents,
+# so the message roles keep alternating. It sits after the cache
+# breakpoint, so it does not affect what gets cached.
+_DOCUMENTS_ACK = "Understood. I'll use these documents as needed."
+
+
+def _render_sidebar_controls() -> tuple[bool, str, list]:
     """Render the chatbot's sidebar controls and return the user choices.
 
     Adds, below the model selector: a web-search toggle, a reasoning-level
-    selector, and a button to start a new conversation.
+    selector, a conversation-documents uploader, and a button to start a
+    new conversation (which also clears the documents).
 
     Returns:
-        A (web_search_enabled, thinking_level) tuple, where
-        thinking_level is one of the keys of tools_config.THINKING_LEVELS.
+        A (web_search_enabled, thinking_level, conversation_files) tuple.
+        conversation_files is the list of files uploaded for the whole
+        conversation (possibly empty).
     """
     with st.sidebar:
         web_search_enabled = st.toggle(
@@ -61,11 +77,28 @@ def _render_sidebar_controls() -> tuple[bool, str]:
                 "levels improve hard questions but cost more and are slower."
             ),
         )
+
+        st.markdown("**Conversation documents**")
+        st.caption(
+            "Available to the whole conversation and re-used each turn "
+            "(cached to limit cost). For images inside Office files, "
+            "convert to PDF first."
+        )
+        conversation_files = st.file_uploader(
+            "Add documents",
+            type=attachments.ALLOWED_EXTENSIONS,
+            accept_multiple_files=True,
+            key=f"chat_docs_{st.session_state.chat_docs_nonce}",
+            label_visibility="collapsed",
+        )
+
         if st.button("New conversation", width="stretch", key="chat_new"):
             st.session_state.chat_messages = []
+            # Bump the nonce so the document uploader resets to empty.
+            st.session_state.chat_docs_nonce += 1
             st.rerun()
 
-    return web_search_enabled, thinking_level
+    return web_search_enabled, thinking_level, conversation_files or []
 
 
 def _render_assistant_message(content: str) -> None:
@@ -101,7 +134,8 @@ def _render_history() -> None:
 def _build_display_text(text: str, labels: list[str]) -> str:
     """Build the lightweight text stored and shown for a user turn.
 
-    Combines the typed text with a short note listing any attached files.
+    Combines the typed text with a short note listing any files attached
+    to this specific message.
 
     Args:
         text: The text the user typed (may be empty).
@@ -116,26 +150,59 @@ def _build_display_text(text: str, labels: list[str]) -> str:
     return f"{text}\n\n{note}" if text else note
 
 
+def _build_document_prefix(conversation_files: list) -> list[dict]:
+    """Build the cached conversation-documents prefix messages.
+
+    Converts the conversation documents into content blocks (with a cache
+    breakpoint) and wraps them as a user message followed by a short
+    synthetic assistant acknowledgement, so the message roles alternate.
+
+    Args:
+        conversation_files: Files uploaded for the whole conversation.
+
+    Returns:
+        A list of zero or two messages to prepend to the request. Empty
+        when there are no conversation documents.
+
+    Raises:
+        attachments.AttachmentError: If a document is too large or of an
+            unsupported type.
+    """
+    if not conversation_files:
+        return []
+    document_blocks, _labels = attachments.build_attachment_blocks(
+        conversation_files, cache_last_block=True
+    )
+    return [
+        {"role": "user", "content": document_blocks},
+        {"role": "assistant", "content": _DOCUMENTS_ACK},
+    ]
+
+
 def _handle_new_message(
     text: str,
     files: list,
+    conversation_files: list,
     role: str,
     tools: list[dict],
     thinking_budget: int | None,
 ) -> None:
-    """Send a user message (with optional attachments) and store the turn.
+    """Send a user message and store the turn.
 
-    Attachments are sent with this turn only; the stored history keeps a
-    lightweight trace instead of the file data.
+    Builds the request as: cached conversation-documents prefix, then the
+    prior conversation history, then the current user turn (which may
+    carry its own current-message attachments). Only lightweight text is
+    stored in the history.
 
     Args:
         text: The text the user typed (may be empty if only files sent).
-        files: Files attached to this message (may be empty).
+        files: Files attached to this specific message (may be empty).
+        conversation_files: Documents shared across the whole conversation.
         role: The model role to answer with.
         tools: Server tools to enable for this turn (may be empty).
         thinking_budget: Extended-thinking token budget, or None.
     """
-    # Convert attachments to content blocks for this turn only.
+    # Current-message attachments (this turn only).
     attachment_blocks: list[dict] = []
     labels: list[str] = []
     if files:
@@ -145,7 +212,14 @@ def _handle_new_message(
             st.error(str(exc))
             return
 
-    # Content actually sent to the model: attachments first, then text.
+    # Conversation-level documents (cached, re-sent every turn).
+    try:
+        document_prefix = _build_document_prefix(conversation_files)
+    except attachments.AttachmentError as exc:
+        st.error(str(exc))
+        return
+
+    # Content actually sent for this turn: attachments first, then text.
     api_content: list[dict] = list(attachment_blocks)
     if text:
         api_content.append({"type": "text", "text": text})
@@ -156,8 +230,9 @@ def _handle_new_message(
     with st.chat_message("user"):
         st.markdown(display_text)
 
-    # Prior (lightweight) history plus this turn's full content.
-    api_messages = list(st.session_state.chat_messages)
+    # Document prefix, then prior (lightweight) history, then this turn.
+    api_messages = list(document_prefix)
+    api_messages.extend(st.session_state.chat_messages)
     api_messages.append({"role": "user", "content": api_content})
 
     with st.chat_message("assistant"):
@@ -190,7 +265,9 @@ def render() -> None:
     This is the entry point the app's navigation calls for this page.
     """
     role = select_chatbot_model()
-    web_search_enabled, thinking_level = _render_sidebar_controls()
+    web_search_enabled, thinking_level, conversation_files = (
+        _render_sidebar_controls()
+    )
 
     st.header("Chatbot")
     st.caption(
@@ -214,5 +291,10 @@ def render() -> None:
         )
         budget = tools_config.thinking_budget(thinking_level)
         _handle_new_message(
-            submission.text or "", submission.files, role, tools, budget
+            submission.text or "",
+            submission.files,
+            conversation_files,
+            role,
+            tools,
+            budget,
         )
