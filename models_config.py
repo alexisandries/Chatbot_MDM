@@ -76,11 +76,11 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "is recommended."
         ),
         default_temperature=0.2,
-        default_max_tokens=8192,
+        default_max_tokens=16384,
     ),
     "sonnet": ModelSpec(
-        api_id="claude-sonnet-4-6",
-        display_name="Claude Sonnet 4.6",
+        api_id="claude-sonnet-5",
+        display_name="Claude Sonnet 5",
         provider="anthropic",
         description=(
             "High quality at a moderate cost (about 3x the economy tier). "
@@ -88,7 +88,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "default for most work."
         ),
         default_temperature=0.3,
-        default_max_tokens=16384,
+        default_max_tokens=64000,
     ),
     "opus": ModelSpec(
         api_id="claude-opus-4-8",
@@ -100,7 +100,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "the other tiers."
         ),
         default_temperature=0.4,
-        default_max_tokens=16384,
+        default_max_tokens=32000,
         # Opus 4.8 rejects the temperature parameter, so the gateway must
         # omit it for this model.
         supports_temperature=False,
