@@ -89,6 +89,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         ),
         default_temperature=0.3,
         default_max_tokens=64000,
+        supports_temperature=False, 
     ),
     "opus": ModelSpec(
         api_id="claude-opus-4-8",
