@@ -2,10 +2,10 @@
 
 This module renders a chat interface in the style of consumer LLM apps:
 a running conversation history, streamed responses, an easy way to copy
-any answer, file attachments, and a button to start a new conversation.
-It also exposes capabilities in the sidebar: web search, an extended-
-thinking level, and conversation-level documents. It holds the UI only;
-the model call goes through the LLM gateway.
+or download any answer, file attachments, and a button to start a new
+conversation. It also exposes capabilities in the sidebar: web search, an
+extended-thinking level, and conversation-level documents. It holds the UI
+only; the model call goes through the LLM gateway.
 
 TWO WAYS TO ATTACH FILES
 ========================
@@ -21,6 +21,15 @@ Conversation documents (sidebar uploader)
     re-reading them costs a fraction of the normal token price. Best for a
     reference document the user asks several questions about.
 
+DOWNLOADING AN ANSWER
+=====================
+Every assistant answer carries two controls: a copy button and a Word
+download button. The download converts the answer (Markdown) into a .docx
+on the fly (see chat_export), so a drafted e-mail, memo or letter can be
+saved directly. This is a plain chat interface: the model itself cannot
+create or send files, it only writes text — the download is provided by
+the UI, not by the model.
+
 STORED STATE
 ============
 The conversation is stored in session_state under "chat_messages" as a
@@ -33,6 +42,7 @@ sidebar uploader, rebuilt into the request each turn.
 import streamlit as st
 
 import attachments
+import chat_export
 import llm_client
 import tools_config
 from chatbot_prompts import build_chatbot_system_prompt
@@ -56,7 +66,7 @@ A conversational assistant powered by Claude. A few tips to get the most out of 
 - **Attach to one message** (paperclip in the message box) — the file is used for that message only.
 - **Conversation documents** (sidebar) — upload a reference document to ask several questions about; it stays available for the whole conversation and is cached to limit cost.
 - **File types** — images and PDFs are read in full, including visuals; Office files are read as text only (convert to PDF if their images matter).
-- **Copy** any answer with the 📋 button; **New conversation** (sidebar) clears the chat and its documents.
+- **Copy** any answer with the 📋 button, or **download** it as a Word document with the ⬇️ button (handy for drafted e-mails, memos or letters); **New conversation** (sidebar) clears the chat and its documents.
 """
 
 
@@ -129,32 +139,58 @@ def _render_sidebar_controls() -> tuple[bool, str, list]:
     return web_search_enabled, thinking_level, conversation_files or []
 
 
-def _render_assistant_message(content: str) -> None:
-    """Render an assistant message with an easy way to copy its text.
+def _render_message_actions(content: str, key: str) -> None:
+    """Render the copy and Word-download controls for an assistant answer.
 
-    Shows the answer as Markdown for readability, plus a small popover
-    holding the same text in a code block, which Streamlit renders with a
-    built-in copy button.
+    Places two small controls side by side: a popover holding the text in
+    a code block (Streamlit renders it with a native copy button), and a
+    download button that turns the answer into a .docx via chat_export.
+
+    Args:
+        content: The assistant message text (Markdown).
+        key: A suffix that makes the download button's widget key unique
+            across all messages on screen (e.g. the message index).
+    """
+    copy_col, download_col, _spacer = st.columns([1, 1, 5])
+    with copy_col:
+        # A code block exposes Streamlit's native one-click copy button.
+        with st.popover("📋 Copy"):
+            st.code(content, language=None)
+    with download_col:
+        st.download_button(
+            "⬇️ Word",
+            data=chat_export.build_message_docx(content),
+            file_name=chat_export.filename_for_message(content),
+            mime=chat_export.DOCX_MIME,
+            key=f"chat_dl_{key}",
+        )
+
+
+def _render_assistant_message(content: str, index: int) -> None:
+    """Render an assistant message with copy and download controls.
+
+    Shows the answer as Markdown for readability, then the shared action
+    controls (copy, download as Word).
 
     Args:
         content: The assistant message text.
+        index: The message's position in the history, used to key the
+            download button uniquely.
     """
     st.markdown(content)
-    with st.popover("📋 Copy"):
-        # A code block exposes Streamlit's native one-click copy button.
-        st.code(content, language=None)
+    _render_message_actions(content, key=str(index))
 
 
 def _render_history() -> None:
     """Render the full conversation stored in session_state.
 
     User messages are shown as Markdown; assistant messages additionally
-    get a copy control.
+    get copy and download controls.
     """
-    for message in st.session_state.chat_messages:
+    for index, message in enumerate(st.session_state.chat_messages):
         with st.chat_message(message["role"]):
             if message["role"] == "assistant":
-                _render_assistant_message(message["content"])
+                _render_assistant_message(message["content"], index)
             else:
                 st.markdown(message["content"])
 
@@ -277,6 +313,9 @@ def _handle_new_message(
         except llm_client.LLMError as exc:
             st.error(str(exc))
             return
+        # Make copy/download available immediately on the fresh answer,
+        # without waiting for the next rerun to re-render the history.
+        _render_message_actions(response, key="live")
 
     # Persist only the lightweight versions (no heavy file data re-sent).
     st.session_state.chat_messages.append(
