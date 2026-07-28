@@ -3,22 +3,22 @@
 PURPOSE AND ROLE IN THE ARCHITECTURE
 =====================================
 This module is the ONLY place in the codebase that touches the Anthropic
-SDK. All other modules — translation UI, chatbot UI, glossary checker,
-future refinement pipelines — import from here and never instantiate an
+SDK. All other modules - translation UI, chatbot UI, glossary checker,
+future refinement pipelines - import from here and never instantiate an
 `anthropic.Anthropic` client themselves.
 
 That constraint buys three concrete benefits:
 
   1. Model resolution by role, never by hard-coded string.
      Callers ask for role="standard" or role="utility". The actual API
-     model string (e.g. "claude-sonnet-4-6") is resolved through
+     model string (e.g. "claude-sonnet-5") is resolved through
      models_config.py. When Anthropic releases a new model and we want
      to upgrade a tier, we change one line in models_config.py and
      nothing else in the application changes.
 
   2. Centralised error handling.
-     Every exception that the Anthropic SDK can raise — authentication
-     failures, rate limits, transient network errors, empty responses —
+     Every exception that the Anthropic SDK can raise - authentication
+     failures, rate limits, transient network errors, empty responses -
      is caught here and re-raised as LLMError with a message that is
      safe and meaningful to show directly in the UI via st.error(). No
      try/except blocks are scattered through feature code.
@@ -29,6 +29,24 @@ That constraint buys three concrete benefits:
      change will be: add the new SDK import, add a branch in complete()
      and stream(), extend the guard. Callers will not notice.
 
+REASONING (THINKING AND EFFORT)
+================================
+Reasoning depth is expressed as a named level ("Off", "Standard",
+"Deep", "Extended") defined in models_config.REASONING_LEVELS, not as a
+token budget. The gateway translates the level into the two parameters
+the API expects:
+
+    thinking      {"type": "adaptive"} or {"type": "disabled"}
+    output_config {"effort": "low" | "medium" | "high" | "xhigh"}
+
+Not every model accepts these parameters: Haiku 4.5 supports neither, so
+the registry flags `supports_adaptive_thinking` and `supports_effort`
+tell the gateway what to omit. Callers pass the same level regardless of
+the model; the gateway silently drops what the model cannot handle.
+
+Thinking tokens count towards `max_tokens`, so a high reasoning level on
+a small token ceiling can truncate the visible answer. The registry
+defaults are sized with that in mind.
 
 PUBLIC API SUMMARY
 ==================
@@ -59,27 +77,26 @@ Three functions and one exception class form the public contract:
       is always human-readable and safe to pass to st.error(). It never
       leaks the API key or raw SDK internals.
 
-
 PRIVATE HELPERS (not for import)
 =================================
   _get_anthropic_client()   Reads the API key from st.secrets and
                             returns a cached SDK client (@cache_resource
                             ensures a single instance per process across
                             all Streamlit reruns).
-
   _resolve(role)            Maps a role string to a ModelSpec via
                             models_config.get_model_for_role(), then
                             verifies the provider is supported. Raises
                             LLMError (not KeyError) so callers always
                             deal with a single exception type.
-
   _normalize_messages()     Enforces the prompt-XOR-messages contract
                             and converts a bare prompt string into the
                             list format the Anthropic Messages API
                             expects.
+  _reasoning_params()       Turns a reasoning level name into the
+                            thinking / output_config parameters the
+                            model actually supports.
 
-
-HOW TO CALL THIS MODULE — QUICK EXAMPLES
+HOW TO CALL THIS MODULE - QUICK EXAMPLES
 =========================================
 One-shot translation (most common case):
 
@@ -90,6 +107,7 @@ One-shot translation (most common case):
             role="standard",
             system="You are a professional translator...",
             prompt="Translate the following text: ...",
+            reasoning="Off",
         )
     except LLMError as exc:
         st.error(str(exc))
@@ -115,15 +133,20 @@ Streaming chatbot response:
     try:
         with st.chat_message("assistant"):
             response = st.write_stream(
-                stream(role="standard", system=SYSTEM, messages=history)
+                stream(
+                    role="standard",
+                    system=SYSTEM,
+                    messages=history,
+                    reasoning="Standard",
+                )
             )
     except LLMError as exc:
         st.error(str(exc))
 
-
 SECRETS
 =======
 The Anthropic API key is read exclusively from:
+
     st.secrets["ANTHROPIC_API_KEY"]
 
 Add it to .streamlit/secrets.toml (see secrets.toml.example). The key
@@ -137,7 +160,7 @@ from collections.abc import Iterator
 import anthropic
 import streamlit as st
 
-from models_config import ModelSpec, get_model_for_role
+from models_config import ModelSpec, get_model_for_role, get_reasoning_level
 
 
 class LLMError(Exception):
@@ -171,6 +194,7 @@ def _get_anthropic_client() -> anthropic.Anthropic:
             "ANTHROPIC_API_KEY is missing from secrets. "
             "Add it to .streamlit/secrets.toml (see secrets.toml.example)."
         ) from exc
+
     return anthropic.Anthropic(api_key=api_key)
 
 
@@ -191,6 +215,7 @@ def _resolve(role: str) -> ModelSpec:
         spec = get_model_for_role(role)
     except KeyError as exc:
         raise LLMError(str(exc)) from exc
+
     if spec.provider != "anthropic":
         # Placeholder for future providers (e.g. Mistral): add a branch
         # in complete() / stream() and extend this check.
@@ -198,6 +223,7 @@ def _resolve(role: str) -> ModelSpec:
             f"Provider '{spec.provider}' is not implemented. "
             f"Only 'anthropic' is currently supported."
         )
+
     return spec
 
 
@@ -227,9 +253,55 @@ def _normalize_messages(
         raise LLMError(
             "Pass exactly one of 'prompt' or 'messages' to the LLM layer."
         )
+
     if prompt is not None:
         return [{"role": "user", "content": prompt}]
+
     return messages
+
+
+def _reasoning_params(spec: ModelSpec, reasoning: str | None) -> dict:
+    """Build the thinking and effort parameters for one request.
+
+    Translates a reasoning level name into the API parameters the given
+    model actually supports. Anything the model cannot handle is simply
+    left out, so the same level can be passed for every model without
+    the caller having to know which one is selected.
+
+    Args:
+        spec: The model the request will be sent to. Its
+            supports_adaptive_thinking and supports_effort flags decide
+            which parameters are emitted.
+        reasoning: Name of a level defined in
+            models_config.REASONING_LEVELS, or None to let the API apply
+            its own defaults (adaptive thinking at high effort).
+
+    Returns:
+        A dict to merge into the request parameters. It may be empty,
+        and may contain "thinking", "output_config", or both.
+
+    Raises:
+        LLMError: If the reasoning level name is unknown.
+    """
+    if reasoning is None:
+        return {}
+
+    try:
+        level = get_reasoning_level(reasoning)
+    except KeyError as exc:
+        raise LLMError(str(exc)) from exc
+
+    params: dict = {}
+
+    if spec.supports_adaptive_thinking:
+        params["thinking"] = {
+            "type": "adaptive" if level.thinking_enabled else "disabled"
+        }
+
+    if spec.supports_effort:
+        params["output_config"] = {"effort": level.effort}
+
+    return params
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +315,7 @@ def complete(
     messages: list[dict] | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    reasoning: str | None = None,
 ) -> str:
     """Run a one-shot (non-streaming) LLM completion.
 
@@ -250,22 +323,29 @@ def complete(
     task where the full answer is needed before display.
 
     Args:
-        role: Model role ("economy", "standard", "premium", "utility").
-            The concrete model is resolved from models_config.py.
+        role: Model role ("economy", "standard", "premium", "frontier",
+            "utility"). The concrete model is resolved from
+            models_config.py.
         system: System prompt defining the model's task and constraints.
         prompt: Single user message. Mutually exclusive with `messages`.
         messages: Full conversation history as a list of
             {"role": ..., "content": ...} dicts. Mutually exclusive
             with `prompt`.
         temperature: Sampling temperature. Defaults to the model's
-            default_temperature from the registry.
-        max_tokens: Output token cap. Defaults to the model's
-            default_max_tokens from the registry.
+            default_temperature from the registry. Silently ignored for
+            models whose registry entry sets supports_temperature=False.
+        max_tokens: Output token cap, thinking tokens included. Defaults
+            to the model's default_max_tokens from the registry.
+        reasoning: Name of a level in models_config.REASONING_LEVELS.
+            None leaves the API defaults in place. Pass "Off" for
+            mechanical tasks such as translation or glossary lookups,
+            where reasoning adds cost and latency without improving the
+            result.
 
     Returns:
         The model's text response, stripped of leading/trailing
         whitespace. Multiple text blocks (rare) are joined with
-        newlines.
+        newlines. Reasoning blocks are excluded.
 
     Raises:
         LLMError: On configuration problems or any API failure
@@ -274,6 +354,7 @@ def complete(
     """
     spec = _resolve(role)
     client = _get_anthropic_client()
+
     params = {
         "model": spec.api_id,
         "system": system,
@@ -281,13 +362,16 @@ def complete(
         "max_tokens": (
             max_tokens if max_tokens is not None else spec.default_max_tokens
         ),
+        **_reasoning_params(spec, reasoning),
     }
+
     # Only send temperature to models that accept it; some models reject
     # the parameter outright.
     if spec.supports_temperature:
         params["temperature"] = (
             temperature if temperature is not None else spec.default_temperature
         )
+
     try:
         response = client.messages.create(**params)
     except anthropic.AuthenticationError as exc:
@@ -310,6 +394,7 @@ def complete(
     ]
     if not text_parts:
         raise LLMError("The model returned an empty response.")
+
     return "\n".join(text_parts).strip()
 
 
@@ -326,6 +411,9 @@ def complete_json(
     as the glossary term detector. The system/prompt you pass must
     already instruct the model to answer with JSON only; this function
     adds robustness by stripping Markdown code fences before parsing.
+
+    Reasoning is disabled: structured extraction is a mechanical task,
+    and reasoning would add cost and latency for no benefit.
 
     Args:
         role: Model role, typically "utility".
@@ -349,12 +437,15 @@ def complete_json(
         prompt=prompt,
         temperature=temperature,
         max_tokens=max_tokens,
+        reasoning="Off",
     )
+
     cleaned = raw.strip()
     if cleaned.startswith("```"):
         # Remove an opening fence like ``` or ```json and a closing ```.
         cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else ""
         cleaned = cleaned.rsplit("```", 1)[0].strip()
+
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as exc:
@@ -371,34 +462,33 @@ def stream(
     temperature: float | None = None,
     max_tokens: int | None = None,
     tools: list[dict] | None = None,
-    thinking_budget: int | None = None,
+    reasoning: str | None = None,
 ) -> Iterator[str]:
     """Run a streaming completion, yielding text chunks as they arrive.
 
     Intended for the chatbot interface, where chunks are fed directly
     to st.write_stream() so the user sees the answer being typed.
-
-    Server-side tools (e.g. web search) and extended thinking can be
-    enabled per call. When thinking is on, the yielded fragments are the
-    final answer only; the model's internal reasoning is not streamed.
+    Server-side tools (e.g. web search) and reasoning can be enabled per
+    call. The yielded fragments are the final answer only; the model's
+    internal reasoning is never streamed to the user.
 
     Args:
-        role: Model role (usually whatever the user picked in the
-            sidebar: "economy", "standard" or "premium").
+        role: Model role, usually whatever the user picked in the
+            sidebar ("standard", "premium" or "frontier").
         system: System prompt for the conversation.
         messages: Full conversation history as a list of
             {"role": "user"|"assistant", "content": str} dicts.
         temperature: Sampling temperature. Defaults to the model's
-            registry value. Ignored when thinking is enabled (extended
-            thinking requires the default temperature).
-        max_tokens: Output token cap. Defaults to the model's registry
-            value. When thinking is enabled, the budget is added on top
-            so the answer still has room.
+            registry value. Silently ignored for models whose registry
+            entry sets supports_temperature=False.
+        max_tokens: Output token cap, thinking tokens included. Defaults
+            to the model's registry value. A high reasoning level with a
+            low ceiling can truncate the answer.
         tools: Optional list of tool definitions to enable (e.g. the web
             search server tool). Pass None or an empty list for none.
-        thinking_budget: Optional number of tokens to allocate to
-            extended thinking. None disables thinking. Must be at least
-            1024 when set.
+        reasoning: Name of a level in models_config.REASONING_LEVELS,
+            typically the sidebar slider value. None leaves the API
+            defaults in place.
 
     Yields:
         Text fragments in order. Concatenating all fragments gives the
@@ -411,32 +501,26 @@ def stream(
     """
     spec = _resolve(role)
     client = _get_anthropic_client()
-    effective_max_tokens = (
-        max_tokens if max_tokens is not None else spec.default_max_tokens
-    )
+
     params = {
         "model": spec.api_id,
         "system": system,
         "messages": _normalize_messages(None, messages),
+        "max_tokens": (
+            max_tokens if max_tokens is not None else spec.default_max_tokens
+        ),
+        **_reasoning_params(spec, reasoning),
     }
-    if thinking_budget:
-        # Extended thinking needs room for both the reasoning and the
-        # answer, and it requires the default temperature, so temperature
-        # is deliberately not sent here.
-        params["thinking"] = {
-            "type": "enabled",
-            "budget_tokens": thinking_budget,
-        }
-        params["max_tokens"] = thinking_budget + effective_max_tokens
-    else:
-        params["max_tokens"] = effective_max_tokens
-        if spec.supports_temperature:
-            params["temperature"] = (
-                temperature if temperature is not None
-                else spec.default_temperature
-            )
+
+    if spec.supports_temperature:
+        params["temperature"] = (
+            temperature if temperature is not None
+            else spec.default_temperature
+        )
+
     if tools:
         params["tools"] = tools
+
     try:
         with client.messages.stream(**params) as event_stream:
             yield from event_stream.text_stream
@@ -453,4 +537,6 @@ def stream(
     except anthropic.APIError as exc:
         raise LLMError(f"The Anthropic API returned an error: {exc}") from exc
     except Exception as exc:
-        raise LLMError(f"Unexpected error while streaming from the LLM: {exc}") from exc
+        raise LLMError(
+            f"Unexpected error while streaming from the LLM: {exc}"
+        ) from exc
