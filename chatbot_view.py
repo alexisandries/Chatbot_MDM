@@ -3,16 +3,25 @@
 This module renders a chat interface in the style of consumer LLM apps:
 a running conversation history, streamed responses, an easy way to copy
 or download any answer, file attachments, and a button to start a new
-conversation. It also exposes capabilities in the sidebar: web search, an
-extended-thinking level, and conversation-level documents. It holds the UI
-only; the model call goes through the LLM gateway.
+conversation. It also exposes capabilities in the sidebar: web search, a
+reasoning level, and conversation-level documents. It holds the UI only;
+the model call goes through the LLM gateway.
+
+REASONING LEVEL
+===============
+The sidebar slider offers the levels defined in
+models_config.REASONING_LEVELS. The view passes the chosen level name
+straight to the LLM gateway, which translates it into the thinking and
+effort parameters the selected model supports. The view knows nothing
+about those API parameters, so retuning a level never touches this file.
 
 TWO WAYS TO ATTACH FILES
 ========================
 Current-message attachments (chat input)
     Files attached in the chat input apply to that one message only. They
     are sent with that single turn and are NOT re-sent afterwards; the
-    history keeps just a short "📎 filename" trace. Cheap for follow-ups.
+    history keeps just a short "attached filename" trace. Cheap for
+    follow-ups.
 
 Conversation documents (sidebar uploader)
     Files uploaded in the sidebar stay available for the whole
@@ -27,7 +36,7 @@ Every assistant answer carries two controls: a copy button and a Word
 download button. The download converts the answer (Markdown) into a .docx
 on the fly (see chat_export), so a drafted e-mail, memo or letter can be
 saved directly. This is a plain chat interface: the model itself cannot
-create or send files, it only writes text — the download is provided by
+create or send files, it only writes text - the download is provided by
 the UI, not by the model.
 
 STORED STATE
@@ -35,7 +44,7 @@ STORED STATE
 The conversation is stored in session_state under "chat_messages" as a
 list of {"role", "content": str} dicts. Stored content is always the
 lightweight text (never heavy file data): current-message attachments are
-reduced to a "📎" trace, and conversation documents live only in the
+reduced to a short trace, and conversation documents live only in the
 sidebar uploader, rebuilt into the request each turn.
 """
 
@@ -46,21 +55,24 @@ import chat_export
 import llm_client
 import tools_config
 from chatbot_prompts import build_chatbot_system_prompt
+from models_config import (
+    DEFAULT_REASONING_LEVEL,
+    REASONING_LEVELS,
+    get_reasoning_level,
+)
 from session import select_chatbot_model
-
 
 # Synthetic assistant turn placed right after the conversation documents,
 # so the message roles keep alternating. It sits after the cache
 # breakpoint, so it does not affect what gets cached.
 _DOCUMENTS_ACK = "Understood. I'll use these documents as needed."
 
-
 # Concise usage guide shown in an expander under the header. Expanded on
 # an empty conversation (onboarding), collapsed once chatting.
 _USAGE_GUIDE = """\
 A conversational assistant powered by Claude. A few tips to get the most out of it:
 
-- **Model** (sidebar) — Sonnet is the balanced default; switch to Opus for the hardest questions (slower, higher cost).
+- **Model** (sidebar) — Sonnet is the balanced default; Opus handles the hardest questions, and Fable is the most capable of all. Each step up is slower and noticeably more expensive.
 - **Web search** (sidebar) — keep it on for current events or facts that may have changed; turn it off to save cost on offline tasks.
 - **Reasoning** (sidebar) — raise the level for complex, multi-step problems; the assistant thinks more before answering, at higher cost and latency.
 - **Attach to one message** (paperclip in the message box) — the file is used for that message only.
@@ -87,11 +99,12 @@ def _render_sidebar_controls() -> tuple[bool, str, list]:
     """Render the chatbot's sidebar controls and return the user choices.
 
     Adds, below the model selector: a web-search toggle, a reasoning-level
-    selector, a conversation-documents uploader, and a button to start a
+    slider, a conversation-documents uploader, and a button to start a
     new conversation (which also clears the documents).
 
     Returns:
-        A (web_search_enabled, thinking_level, conversation_files) tuple.
+        A (web_search_enabled, reasoning_level, conversation_files) tuple.
+        reasoning_level is a key of models_config.REASONING_LEVELS.
         conversation_files is the list of files uploaded for the whole
         conversation (possibly empty).
     """
@@ -105,16 +118,19 @@ def _render_sidebar_controls() -> tuple[bool, str, list]:
                 "May increase cost and response time."
             ),
         )
-        thinking_level = st.select_slider(
+
+        reasoning_level = st.select_slider(
             "Reasoning",
-            options=list(tools_config.THINKING_LEVELS),
-            value="Off",
-            key="chat_thinking",
+            options=list(REASONING_LEVELS),
+            value=DEFAULT_REASONING_LEVEL,
+            key="chat_reasoning",
             help=(
                 "How much the assistant may think before answering. Higher "
                 "levels improve hard questions but cost more and are slower."
             ),
         )
+        # Explain the level the user is currently on, in its own words.
+        st.caption(get_reasoning_level(reasoning_level).help_text)
 
         st.markdown("**Conversation documents**")
         st.caption(
@@ -136,7 +152,7 @@ def _render_sidebar_controls() -> tuple[bool, str, list]:
             st.session_state.chat_docs_nonce += 1
             st.rerun()
 
-    return web_search_enabled, thinking_level, conversation_files or []
+    return web_search_enabled, reasoning_level, conversation_files or []
 
 
 def _render_message_actions(content: str, key: str) -> None:
@@ -152,10 +168,12 @@ def _render_message_actions(content: str, key: str) -> None:
             across all messages on screen (e.g. the message index).
     """
     copy_col, download_col, _spacer = st.columns([1, 1, 5])
+
     with copy_col:
         # A code block exposes Streamlit's native one-click copy button.
         with st.popover("📋 Copy"):
             st.code(content, language=None)
+
     with download_col:
         st.download_button(
             "⬇️ Word",
@@ -210,6 +228,7 @@ def _build_display_text(text: str, labels: list[str]) -> str:
     """
     if not labels:
         return text
+
     note = "📎 " + ", ".join(labels)
     return f"{text}\n\n{note}" if text else note
 
@@ -234,6 +253,7 @@ def _build_document_prefix(conversation_files: list) -> list[dict]:
     """
     if not conversation_files:
         return []
+
     document_blocks, _labels = attachments.build_attachment_blocks(
         conversation_files, cache_last_block=True
     )
@@ -249,7 +269,7 @@ def _handle_new_message(
     conversation_files: list,
     role: str,
     tools: list[dict],
-    thinking_budget: int | None,
+    reasoning_level: str,
 ) -> None:
     """Send a user message and store the turn.
 
@@ -264,7 +284,9 @@ def _handle_new_message(
         conversation_files: Documents shared across the whole conversation.
         role: The model role to answer with.
         tools: Server tools to enable for this turn (may be empty).
-        thinking_budget: Extended-thinking token budget, or None.
+        reasoning_level: Name of a level in
+            models_config.REASONING_LEVELS, passed through to the LLM
+            gateway.
     """
     # Current-message attachments (this turn only).
     attachment_blocks: list[dict] = []
@@ -287,6 +309,7 @@ def _handle_new_message(
     api_content: list[dict] = list(attachment_blocks)
     if text:
         api_content.append({"type": "text", "text": text})
+
     if not api_content:
         return  # nothing to send
 
@@ -307,12 +330,13 @@ def _handle_new_message(
                     system=build_chatbot_system_prompt(),
                     messages=api_messages,
                     tools=tools,
-                    thinking_budget=thinking_budget,
+                    reasoning=reasoning_level,
                 )
             )
         except llm_client.LLMError as exc:
             st.error(str(exc))
             return
+
         # Make copy/download available immediately on the fresh answer,
         # without waiting for the next rerun to re-render the history.
         _render_message_actions(response, key="live")
@@ -332,13 +356,12 @@ def render() -> None:
     This is the entry point the app's navigation calls for this page.
     """
     role = select_chatbot_model()
-    web_search_enabled, thinking_level, conversation_files = (
+    web_search_enabled, reasoning_level, conversation_files = (
         _render_sidebar_controls()
     )
 
     st.header("Chatbot")
     _render_help()
-
     _render_history()
 
     submission = st.chat_input(
@@ -347,16 +370,16 @@ def render() -> None:
         file_type=attachments.ALLOWED_EXTENSIONS,
         key="chat_input",
     )
+
     if submission and (submission.text or submission.files):
         tools = tools_config.build_chatbot_tools(
             web_search_enabled=web_search_enabled
         )
-        budget = tools_config.thinking_budget(thinking_level)
         _handle_new_message(
             submission.text or "",
             submission.files,
             conversation_files,
             role,
             tools,
-            budget,
+            reasoning_level,
         )
