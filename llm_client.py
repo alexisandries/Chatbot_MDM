@@ -53,10 +53,12 @@ PUBLIC API SUMMARY
 Three functions and one exception class form the public contract:
 
   complete(role, system, prompt=..., messages=..., ...)  -> str
-      Non-streaming, one-shot completion. Use for translation and any
-      task where the full answer must be assembled before display.
-      Accepts either a single `prompt` string or a `messages` list, but
-      not both (enforced by _normalize_messages).
+      One-shot completion returning the whole answer as a string. Use
+      for translation and any task where the full answer must be
+      assembled before display. Accepts either a single `prompt` string
+      or a `messages` list, but not both (enforced by
+      _normalize_messages). It streams from the server internally and
+      reassembles the answer; callers see a blocking call.
 
   complete_json(role, system, prompt, ...)  -> dict | list
       Thin wrapper around complete() that strips Markdown code fences
@@ -317,10 +319,16 @@ def complete(
     max_tokens: int | None = None,
     reasoning: str | None = None,
 ) -> str:
-    """Run a one-shot (non-streaming) LLM completion.
+    """Run a one-shot LLM completion and return the whole answer.
 
     This is the workhorse for translation, refinement and any other
     task where the full answer is needed before display.
+
+    The request is streamed to the server internally, then reassembled
+    before returning. Callers see a plain blocking call. Streaming is
+    not optional here: the SDK rejects non-streamed requests whose
+    estimated duration exceeds ten minutes, which a large max_tokens
+    alone is enough to trigger.
 
     Args:
         role: Model role ("economy", "standard", "premium", "frontier",
@@ -373,7 +381,8 @@ def complete(
         )
 
     try:
-        response = client.messages.create(**params)
+        with client.messages.stream(**params) as event_stream:
+            response = event_stream.get_final_message()
     except anthropic.AuthenticationError as exc:
         raise LLMError(
             "Authentication with the Anthropic API failed. "
