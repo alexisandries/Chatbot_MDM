@@ -1,3 +1,6 @@
+from models_config import get_model_for_role
+
+
 """Translation view: upload or paste content, translate, upgrade, download.
 
 This module renders the Translation interface and wires together the
@@ -285,9 +288,10 @@ def _render_results() -> None:
 
     # --- Upgrade ---
     st.markdown("**Upgrade this translation** ✨")
+    premium_model = get_model_for_role("premium")
     st.caption(
-        "The upgrade always uses Claude Opus 4.8 (premium), whichever "
-        "model is selected on the left."
+        f"The upgrade always uses {premium_model.display_name}, "
+        f"whichever model is selected on the left."
     )
     feedback = st.text_input(
         "Your feedback or guidelines (optional)",
