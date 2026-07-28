@@ -1,21 +1,18 @@
-"""Configuration for chatbot capabilities: web tools and thinking levels.
+"""Configuration for the server-side tools Claude may call.
 
 Like model identifiers, the API version strings for server-side tools
-(for example "web_search_20260318") are identifiers that change over
+(for example "web_search_20260209") are identifiers that change over
 time. They are centralised here so that updating to a new tool version,
 or adjusting a usage cap, is a one-line edit rather than a change buried
 in the views.
 
-This module covers two chatbot capabilities:
-- Web tools: server-side tools Claude can call to read the live web.
-- Thinking levels: how much budget the model may spend on extended
-  reasoning before answering.
+Scope: web tools only. Reasoning depth is not configured here - it is
+defined by models_config.REASONING_LEVELS and applied by llm_client.
 
 Docs:
 - Web search: https://docs.claude.com/en/docs/agents-and-tools/tool-use/web-search-tool
 - Web fetch:  https://docs.claude.com/en/docs/agents-and-tools/tool-use/web-fetch-tool
 """
-
 
 # Web search server tool. "type" is the versioned API identifier; bump it
 # here when Anthropic ships a newer version. "max_uses" caps how many
@@ -57,33 +54,11 @@ def build_chatbot_tools(
         module-level templates.
     """
     tools: list[dict] = []
+
     if web_search_enabled:
         tools.append(dict(_WEB_SEARCH_TOOL))
+
     if web_fetch_enabled:
         tools.append(dict(_WEB_FETCH_TOOL))
+
     return tools
-
-
-# Extended-thinking levels offered in the chatbot, in display order. The
-# value is the thinking budget in tokens, or None to disable thinking.
-# Higher budgets let the model reason more before answering, at higher
-# cost and latency (thinking tokens are billed as output tokens).
-THINKING_LEVELS: dict[str, int | None] = {
-    "Off": None,
-    "Standard": 4000,
-    "Extended": 12000,
-}
-
-
-def thinking_budget(level_name: str) -> int | None:
-    """Return the thinking budget in tokens for a named level.
-
-    Args:
-        level_name: One of the keys of THINKING_LEVELS ("Off",
-            "Standard", "Extended").
-
-    Returns:
-        The budget in tokens, or None when thinking is off or the level
-        is unknown.
-    """
-    return THINKING_LEVELS.get(level_name)
