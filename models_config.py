@@ -50,6 +50,15 @@ class ModelSpec:
         supports_temperature: Whether the model accepts a temperature
             parameter. Some models reject it; when this is False, the
             LLM gateway omits temperature from the request entirely.
+        supports_adaptive_thinking: Whether the model accepts
+            thinking={"type": "adaptive"}. Current-generation models do;
+            Haiku 4.5 and earlier models only support the legacy
+            fixed-budget thinking mode and reject "adaptive" with a 400
+            error. When False, the gateway sends no thinking parameter.
+        supports_effort: Whether the model accepts
+            output_config={"effort": ...}, the parameter that steers how
+            many tokens the model spends on a response. Haiku 4.5 does
+            not support it. When False, the gateway omits it.
     """
 
     api_id: str
@@ -59,6 +68,8 @@ class ModelSpec:
     default_temperature: float
     default_max_tokens: int
     supports_temperature: bool = True
+    supports_adaptive_thinking: bool = True
+    supports_effort: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +88,10 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         ),
         default_temperature=0.2,
         default_max_tokens=16384,
+        # Haiku 4.5 predates both adaptive thinking and the effort
+        # parameter; sending either returns a 400 error.
+        supports_adaptive_thinking=False,
+        supports_effort=False,
     ),
     "sonnet": ModelSpec(
         api_id="claude-sonnet-5",
@@ -101,7 +116,9 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "refining results. Slower than the standard and fast tiers."
         ),
         default_temperature=0.4,
-        default_max_tokens=32000,
+        # Thinking tokens count towards max_tokens, so this ceiling must
+        # leave room for both the reasoning and the visible answer.
+        default_max_tokens=64000,
         # Opus 5 rejects the temperature parameter, so the gateway must
         # omit it for this model.
         supports_temperature=False,
@@ -169,8 +186,97 @@ CHATBOT_SELECTABLE_ROLES: list[str] = ["standard", "premium", "frontier"]
 
 
 # ---------------------------------------------------------------------------
+# Reasoning levels
+# ---------------------------------------------------------------------------
+# Current Claude models no longer accept a thinking token budget. Two
+# parameters replace it:
+#   - thinking: "adaptive" lets the model decide when and how deeply to
+#     reason; "disabled" forbids reasoning entirely.
+#   - output_config.effort: how many tokens the model may spend on the
+#     whole response, thinking included.
+#
+# The levels below are what the chatbot sidebar slider exposes. To add,
+# remove or retune a level, edit only this dictionary.
+
+@dataclass(frozen=True)
+class ReasoningLevel:
+    """One position of the chatbot's "Reasoning" slider.
+
+    Attributes:
+        thinking_enabled: Whether the model may produce reasoning before
+            answering. False maps to thinking={"type": "disabled"}.
+        effort: Effort level sent as output_config.effort. Valid values,
+            from cheapest to most expensive: "low", "medium", "high",
+            "xhigh", "max". Higher levels mean longer, deeper and more
+            costly responses.
+        help_text: Short English sentence shown next to the slider so
+            users understand the speed/cost trade-off.
+    """
+
+    thinking_enabled: bool
+    effort: str
+    help_text: str
+
+
+# Ordered from fastest and cheapest to slowest and most expensive.
+# Note: "Off" is paired with low effort on purpose. Opus 5 rejects
+# disabled thinking at "xhigh" and "max" effort, so those two must never
+# be combined with thinking_enabled=False.
+REASONING_LEVELS: dict[str, ReasoningLevel] = {
+    "Off": ReasoningLevel(
+        thinking_enabled=False,
+        effort="low",
+        help_text="Fastest and cheapest. Answers directly, no reasoning.",
+    ),
+    "Standard": ReasoningLevel(
+        thinking_enabled=True,
+        effort="medium",
+        help_text="Balanced. Thinks briefly on harder questions.",
+    ),
+    "Deep": ReasoningLevel(
+        thinking_enabled=True,
+        effort="high",
+        help_text="Thorough reasoning. Slower and more expensive.",
+    ),
+    "Extended": ReasoningLevel(
+        thinking_enabled=True,
+        effort="xhigh",
+        help_text=(
+            "Maximum depth for long or complex problems. Slowest and "
+            "most expensive."
+        ),
+    ),
+}
+
+# Level applied when the user has not chosen one yet.
+DEFAULT_REASONING_LEVEL: str = "Standard"
+
+
+# ---------------------------------------------------------------------------
 # Accessors
 # ---------------------------------------------------------------------------
+
+def get_reasoning_level(level_name: str) -> ReasoningLevel:
+    """Return the ReasoningLevel matching a slider label.
+
+    Args:
+        level_name: One of the keys of REASONING_LEVELS.
+
+    Returns:
+        The matching ReasoningLevel.
+
+    Raises:
+        KeyError: If the label is unknown. This is a configuration or UI
+            bug and should fail loudly rather than silently downgrade
+            the user's choice.
+    """
+    if level_name not in REASONING_LEVELS:
+        raise KeyError(
+            f"Unknown reasoning level '{level_name}'. "
+            f"Valid levels: {list(REASONING_LEVELS)}"
+        )
+    return REASONING_LEVELS[level_name]
+
 
 def get_model_for_role(role: str) -> ModelSpec:
     """Return the ModelSpec currently assigned to a role.
