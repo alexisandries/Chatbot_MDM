@@ -11,15 +11,41 @@ WHAT THE VIEW CALLS
     estimate_tokens(text)              Rough, free token estimate, used by
                                        the UI to warn before an expensive
                                        translation.
-    translate_text(...)                Detect glossary terms, translate the
-                                       text (chunked if long), and return a
-                                       TranslationResult.
-    upgrade_translation(...)           Improve an existing translation with
-                                       a stronger model and optional user
-                                       feedback.
+    estimate_document_tokens(files)    Same, for natively-read documents.
+    stream_text_translation(...)       Detect glossary terms, then stream
+                                       the translation of a text (chunked
+                                       if long).
+    stream_document_translation(...)   Stream the translation of a PDF or
+                                       image read natively.
+    stream_upgrade(...)                Stream an improved version of an
+                                       existing translation, using a
+                                       stronger model.
     check_compliance(...)              Passive downstream check: report
                                        official terms missing from a
                                        translation.
+
+EVERYTHING STREAMS
+==================
+The three text-producing functions return their output as an iterator of
+text fragments rather than a finished string, so the view can display the
+translation as it is written instead of leaving the user in front of a
+spinner. Two consequences worth knowing:
+
+  1. Validation happens immediately, streaming happens later.
+     Each function validates its arguments and raises TranslationError
+     straight away, before any fragment is produced. Failures that only
+     appear during the API call (rate limit, network) surface later, when
+     the caller consumes the iterator. The caller therefore needs a
+     try/except around the consumption too, not only around the call.
+
+  2. A mid-stream failure loses the partial text.
+     Fragments already yielded are gone once the exception propagates.
+     This is acceptable because a half-finished translation is not usable
+     anyway.
+
+The metadata a caller needs to store alongside the text (glossary
+instructions, source language) is known before the first fragment, so it
+is returned up front in a TranslationStream. See that class for details.
 
 ERRORS
 ======
@@ -42,6 +68,7 @@ while polishing for fluency. The passive compliance check is offered
 separately so the view can flag any remaining discrepancy to the user.
 """
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import fitz  # PyMuPDF, used to count PDF pages
@@ -52,7 +79,6 @@ import glossary
 import language
 import llm_client
 import translation_prompts
-
 
 # Maximum characters per translation chunk. Translation output is roughly
 # as long as its input, so this is kept well within the models' output
@@ -74,6 +100,14 @@ TOKEN_WARNING_THRESHOLD = 30000
 # matching the Anthropic API's per-request document limit.
 MAX_DOCUMENT_PAGES = 100
 
+# Reasoning level (see models_config.REASONING_LEVELS) applied to each
+# step. Translating is a transformation task, not a reasoning one, so
+# thinking is off: it would add cost and latency without improving the
+# result. The upgrade is the deliberate quality step, where weighing
+# register, idiom and terminology against each other does pay off.
+_TRANSLATION_REASONING = "Off"
+_UPGRADE_REASONING = "Standard"
+
 # Rough characters-per-token ratio for European languages. Used only for
 # the advisory estimate, never for billing or hard limits.
 _CHARS_PER_TOKEN = 4
@@ -82,6 +116,9 @@ _CHARS_PER_TOKEN = 4
 # estimate only.
 _PDF_TOKENS_PER_PAGE = 2000
 _IMAGE_TOKENS = 1600
+
+# Separator inserted between two translated chunks of the same text.
+_CHUNK_SEPARATOR = " "
 
 # Placeholder inserted when the user upgrades without typing any feedback,
 # so the upgrade prompt always has a consistent structure.
@@ -105,21 +142,30 @@ class TranslationError(Exception):
 
 
 @dataclass(frozen=True)
-class TranslationResult:
-    """The outcome of a base translation.
+class TranslationStream:
+    """A translation that is about to be produced, fragment by fragment.
+
+    Returned by the two stream_*_translation functions. The metadata
+    fields are final as soon as the object exists; the text itself only
+    materialises as `fragments` is consumed, and can be consumed exactly
+    once.
 
     Attributes:
-        text: The translated text.
-        glossary_instructions: The terminology instruction block that was
-            injected into the translation prompt. The view keeps this so
-            an upgrade can reuse it without paying for glossary detection
-            again.
-        source_language_code: The ISO code the text was translated from.
-        source_language_name: The human-readable source language name,
-            convenient for display.
+        fragments: Iterator of text fragments in order. Concatenating
+            them all gives the complete translation. Consuming it is what
+            triggers the API call, so this is also where a mid-stream
+            TranslationError can be raised.
+        glossary_instructions: The terminology instruction block injected
+            into the translation prompt. Callers keep this so an upgrade
+            can reuse it without paying for glossary detection again.
+        source_language_code: The ISO code the text is translated from.
+            Empty for natively-read documents, where the source language
+            is not detected.
+        source_language_name: Human-readable source language name,
+            convenient for display. "Document" for natively-read files.
     """
 
-    text: str
+    fragments: Iterator[str]
     glossary_instructions: str
     source_language_code: str
     source_language_name: str
@@ -175,22 +221,96 @@ def _glossary_instructions(
     )
 
 
+def _stream_prompt(
+    role: str,
+    system_prompt: str,
+    content,
+    reasoning: str,
+) -> Iterator[str]:
+    """Stream one LLM call, converting gateway errors into view errors.
+
+    Every call this module makes goes through here, so the translation of
+    LLMError into TranslationError happens in exactly one place.
+
+    Args:
+        role: The model role to call.
+        system_prompt: System prompt for the call.
+        content: The user message content. Either a plain string, or the
+            list of content blocks used when a document is attached.
+        reasoning: Reasoning level name passed to the gateway.
+
+    Yields:
+        Text fragments in order.
+
+    Raises:
+        TranslationError: If the call fails. Because this is a generator,
+            the error surfaces while the caller consumes the fragments.
+    """
+    try:
+        yield from llm_client.stream(
+            role=role,
+            system=system_prompt,
+            messages=[{"role": "user", "content": content}],
+            reasoning=reasoning,
+        )
+    except llm_client.LLMError as exc:
+        raise TranslationError(str(exc)) from exc
+
+
 # ---------------------------------------------------------------------------
 # Base translation
 # ---------------------------------------------------------------------------
 
-def translate_text(
+def _iter_text_translation(
+    chunks: list[str],
+    glossary_instructions: str,
+    system_prompt: str,
+    role: str,
+) -> Iterator[str]:
+    """Stream the translation of a text, chunk after chunk.
+
+    Each chunk is a separate API call, but the fragments of all chunks
+    form one continuous stream, so the reader sees a single text being
+    written rather than a series of blocks.
+
+    Args:
+        chunks: The source text already split into translatable pieces.
+        glossary_instructions: Terminology block to inject in each call.
+        system_prompt: The translation system prompt.
+        role: The model role to translate with.
+
+    Yields:
+        Text fragments in order, with a separator between chunks.
+
+    Raises:
+        TranslationError: If any chunk's API call fails.
+    """
+    for index, chunk in enumerate(chunks):
+        if index:
+            yield _CHUNK_SEPARATOR
+
+        user_prompt = translation_prompts.build_translation_user_prompt(
+            chunk, glossary_instructions
+        )
+        yield from _stream_prompt(
+            role, system_prompt, user_prompt, _TRANSLATION_REASONING
+        )
+
+
+def stream_text_translation(
     text: str,
     source_language_code: str,
     target_language_code: str,
     role: str,
-) -> TranslationResult:
-    """Translate a text, enforcing the institutional glossary.
+) -> TranslationStream:
+    """Prepare a streamed translation of a text, enforcing the glossary.
 
-    Detects glossary terms in the source, injects them as binding
-    instructions, then translates the text. Long texts are split into
-    chunks and translated piece by piece; the pieces are joined back
-    together.
+    Detects glossary terms in the source and injects them as binding
+    instructions. Long texts are split into chunks translated one after
+    the other; the caller sees a single continuous stream.
+
+    Glossary detection runs here, before returning, so the caller has the
+    terminology block available immediately.
 
     Args:
         text: The source text to translate.
@@ -198,19 +318,20 @@ def translate_text(
             "fr"). Typically obtained from language.detect_language().
         target_language_code: ISO code of the target language (e.g.
             "nl"). Typically chosen by the user.
-        role: The model role to translate with ("economy" or "standard").
+        role: The model role to translate with ("economy", "standard" or
+            "premium").
 
     Returns:
-        A TranslationResult with the translated text and the glossary
-        instructions that were used.
+        A TranslationStream. Consume its `fragments` to produce the text.
 
     Raises:
-        TranslationError: If the text is empty, if source and target
-            languages are the same, or if the LLM call fails. The message
-            is suitable for display to the user.
+        TranslationError: Immediately if the text is empty or if source
+            and target languages are the same; later, while the fragments
+            are consumed, if an API call fails.
     """
     if not text or not text.strip():
         raise TranslationError("There is no text to translate.")
+
     if source_language_code and source_language_code == target_language_code:
         raise TranslationError(
             "The source and target languages are the same. "
@@ -226,23 +347,12 @@ def translate_text(
     system_prompt = translation_prompts.build_translation_system_prompt(
         source_name, target_name
     )
-
     chunks = chunking.chunk_text(text, max_len=TRANSLATION_CHUNK_CHARS)
-    translated_pieces = []
-    for chunk in chunks:
-        user_prompt = translation_prompts.build_translation_user_prompt(
-            chunk, glossary_instructions
-        )
-        try:
-            piece = llm_client.complete(
-                role=role, system=system_prompt, prompt=user_prompt
-            )
-        except llm_client.LLMError as exc:
-            raise TranslationError(str(exc)) from exc
-        translated_pieces.append(piece)
 
-    return TranslationResult(
-        text=" ".join(translated_pieces),
+    return TranslationStream(
+        fragments=_iter_text_translation(
+            chunks, glossary_instructions, system_prompt, role
+        ),
         glossary_instructions=glossary_instructions,
         source_language_code=source_language_code,
         source_language_name=source_name,
@@ -292,12 +402,12 @@ def estimate_document_tokens(files) -> int:
     return total
 
 
-def translate_document(
+def stream_document_translation(
     files,
     target_language_code: str,
     role: str,
-) -> TranslationResult:
-    """Translate a PDF or image document read natively into clean text.
+) -> TranslationStream:
+    """Prepare a streamed translation of a natively-read PDF or image.
 
     The document is sent to the model as-is (not extracted to text first),
     so the model sees its layout and can drop artefacts, follow the correct
@@ -312,14 +422,15 @@ def translate_document(
             "premium").
 
     Returns:
-        A TranslationResult. Its source_language_code is empty (the source
-        language is not detected for native documents) and its
+        A TranslationStream whose source_language_code is empty (the
+        source language is not detected for native documents) and whose
         source_language_name is "Document".
 
     Raises:
-        TranslationError: If there is no document, if a PDF exceeds the
-            page limit, or if the LLM call fails. The message is suitable
-            for display to the user.
+        TranslationError: Immediately if there is no document, if a PDF
+            exceeds the page limit, or if a file cannot be attached;
+            later, while the fragments are consumed, if the API call
+            fails.
     """
     if not files:
         raise TranslationError("There is no document to translate.")
@@ -350,20 +461,14 @@ def translate_document(
     user_text = translation_prompts.build_native_translation_user_text(
         glossary_instructions
     )
+
     content = list(document_blocks)
     content.append({"type": "text", "text": user_text})
 
-    try:
-        text = llm_client.complete(
-            role=role,
-            system=system_prompt,
-            messages=[{"role": "user", "content": content}],
-        )
-    except llm_client.LLMError as exc:
-        raise TranslationError(str(exc)) from exc
-
-    return TranslationResult(
-        text=text,
+    return TranslationStream(
+        fragments=_stream_prompt(
+            role, system_prompt, content, _TRANSLATION_REASONING
+        ),
         glossary_instructions=glossary_instructions,
         source_language_code="",
         source_language_name="Document",
@@ -374,7 +479,7 @@ def translate_document(
 # Upgrade / refinement
 # ---------------------------------------------------------------------------
 
-def upgrade_translation(
+def stream_upgrade(
     source_text: str,
     current_translation: str,
     user_feedback: str,
@@ -382,8 +487,8 @@ def upgrade_translation(
     target_language_code: str,
     role: str = "premium",
     glossary_instructions: str | None = None,
-) -> str:
-    """Produce an improved version of an existing translation.
+) -> Iterator[str]:
+    """Prepare a streamed, improved version of an existing translation.
 
     Runs the translation through a stronger model with an editor prompt
     that checks fidelity against the source, applies optional user
@@ -406,15 +511,16 @@ def upgrade_translation(
             source text.
 
     Returns:
-        The improved translation text.
+        An iterator of text fragments forming the improved translation.
 
     Raises:
-        TranslationError: If there is no translation to upgrade, if the
-            translation is too long to upgrade in one pass, or if the LLM
-            call fails. The message is suitable for display to the user.
+        TranslationError: Immediately if there is no translation to
+            upgrade or if it is too long for a single pass; later, while
+            the fragments are consumed, if the API call fails.
     """
     if not current_translation or not current_translation.strip():
         raise TranslationError("There is no translation to upgrade.")
+
     if len(current_translation) > UPGRADE_MAX_CHARS:
         raise TranslationError(
             "This translation is too long to upgrade in one pass "
@@ -432,7 +538,11 @@ def upgrade_translation(
     # A translation produced from a natively-read document has no
     # plain-text source. Substitute a placeholder so the editor focuses on
     # quality and terminology rather than a source it cannot see.
-    source_for_prompt = source_text if source_text and source_text.strip() else _NO_SOURCE_PLACEHOLDER
+    source_for_prompt = (
+        source_text
+        if source_text and source_text.strip()
+        else _NO_SOURCE_PLACEHOLDER
+    )
 
     feedback = user_feedback.strip() if user_feedback else ""
     if not feedback:
@@ -443,12 +553,9 @@ def upgrade_translation(
         source_for_prompt, current_translation, feedback, glossary_instructions
     )
 
-    try:
-        return llm_client.complete(
-            role=role, system=system_prompt, prompt=user_prompt
-        )
-    except llm_client.LLMError as exc:
-        raise TranslationError(str(exc)) from exc
+    return _stream_prompt(
+        role, system_prompt, user_prompt, _UPGRADE_REASONING
+    )
 
 
 # ---------------------------------------------------------------------------
