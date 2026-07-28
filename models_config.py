@@ -98,7 +98,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         description=(
             "High-end quality at moderate cost (about 1.7x the standard tier). "
             "Best for complex tasks, demanding enterprise work, and for "
-            "refining results. Slower than the standard and fast tiers."
+            "refining results. Slower than sonnet/haiku."
         ),
         default_temperature=0.4,
         default_max_tokens=32000,
