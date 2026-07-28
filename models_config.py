@@ -92,13 +92,13 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         supports_temperature=False, 
     ),
     "opus": ModelSpec(
-        api_id="claude-opus-4-8",
-        display_name="Claude Opus 4.8",
+        api_id="claude-opus-5",
+        display_name="Claude Opus 5",
         provider="anthropic",
         description=(
-            "Top quality at the highest cost (about 5x the standard tier). "
-            "Best for demanding work and for refining results. Slower than "
-            "the other tiers."
+            "High-end quality at moderate cost (about 1.7x the standard tier). "
+            "Best for complex tasks, demanding enterprise work, and for "
+            "refining results. Slower than the standard and fast tiers."
         ),
         default_temperature=0.4,
         default_max_tokens=32000,
