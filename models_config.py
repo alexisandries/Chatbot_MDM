@@ -31,10 +31,10 @@ class ModelSpec:
 
     Attributes:
         api_id: Exact model string expected by the provider's API
-            (e.g. "claude-sonnet-4-6"). This is the only place in the
+            (e.g. "claude-sonnet-5"). This is the only place in the
             codebase where such strings may appear.
         display_name: Human-friendly name shown in the UI
-            (e.g. "Claude Sonnet 4.6").
+            (e.g. "Claude Sonnet 5").
         provider: Provider key, currently always "anthropic". Kept as a
             field so a second provider (e.g. "mistral") can be added
             later without changing the registry's structure.
@@ -89,7 +89,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         ),
         default_temperature=0.3,
         default_max_tokens=64000,
-        supports_temperature=False, 
+        supports_temperature=False,
     ),
     "opus": ModelSpec(
         api_id="claude-opus-5",
@@ -98,12 +98,29 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         description=(
             "High-end quality at moderate cost (about 1.7x the standard tier). "
             "Best for complex tasks, demanding enterprise work, and for "
-            "refining results. Slower than sonnet/haiku."
+            "refining results. Slower than the standard and fast tiers."
         ),
         default_temperature=0.4,
         default_max_tokens=32000,
-        # Opus 4.8 rejects the temperature parameter, so the gateway must
+        # Opus 5 rejects the temperature parameter, so the gateway must
         # omit it for this model.
+        supports_temperature=False,
+    ),
+    "fable": ModelSpec(
+        api_id="claude-fable-5",
+        display_name="Claude Fable 5",
+        provider="anthropic",
+        description=(
+            "Top-of-the-range model, and the most expensive (about 2x the "
+            "high-end tier). Best for open-ended thinking, writing and "
+            "long, difficult problems. Reserve it for work where the extra "
+            "quality is worth the cost."
+        ),
+        default_temperature=0.4,
+        default_max_tokens=64000,
+        # Like the other current-generation models, Fable 5 rejects the
+        # temperature parameter; response length and depth are steered
+        # through the effort setting instead.
         supports_temperature=False,
     ),
 }
@@ -112,10 +129,10 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
 # ---------------------------------------------------------------------------
 # Roles: stable names used everywhere else in the application
 # ---------------------------------------------------------------------------
-
-# The application code NEVER asks for "sonnet" or "claude-sonnet-4-6";
+# The application code NEVER asks for "sonnet" or "claude-sonnet-5";
 # it asks for a role. Repointing a role to another model is a one-line
 # change here.
+
 ROLE_TO_MODEL: dict[str, str] = {
     # Fast, near-free translation (replaces the old Google Translate tier).
     "economy": "haiku",
@@ -123,6 +140,9 @@ ROLE_TO_MODEL: dict[str, str] = {
     "standard": "sonnet",
     # Upgrade / refinement of an existing translation.
     "premium": "opus",
+    # Highest capability available, at the highest cost. Offered in the
+    # chatbot only, for open-ended or particularly demanding requests.
+    "frontier": "fable",
     # Internal machinery (glossary term detection, language tasks, ...).
     # Never shown to the user as a choice.
     "utility": "haiku",
@@ -138,9 +158,14 @@ ROLE_TO_MODEL: dict[str, str] = {
 # translation selector simply lets the user also run the FIRST-PASS
 # translation with the top model.
 #
+# "frontier" is deliberately absent from the translation selector: its
+# added value is reasoning depth, which translation does not need, while
+# its cost is the highest of all tiers.
+#
 # To change which tiers a view offers, edit only the relevant list here.
+
 TRANSLATION_SELECTABLE_ROLES: list[str] = ["economy", "standard", "premium"]
-CHATBOT_SELECTABLE_ROLES: list[str] = ["standard", "premium"]
+CHATBOT_SELECTABLE_ROLES: list[str] = ["standard", "premium", "frontier"]
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +177,7 @@ def get_model_for_role(role: str) -> ModelSpec:
 
     Args:
         role: One of the keys of ROLE_TO_MODEL ("economy", "standard",
-            "premium", "utility").
+            "premium", "frontier", "utility").
 
     Returns:
         The ModelSpec the role is mapped to.
@@ -168,12 +193,14 @@ def get_model_for_role(role: str) -> ModelSpec:
             f"Unknown model role '{role}'. "
             f"Valid roles: {sorted(ROLE_TO_MODEL)}"
         )
+
     model_key = ROLE_TO_MODEL[role]
     if model_key not in MODEL_REGISTRY:
         raise KeyError(
             f"Role '{role}' points to unknown model key '{model_key}'. "
             f"Check ROLE_TO_MODEL and MODEL_REGISTRY in models_config.py."
         )
+
     return MODEL_REGISTRY[model_key]
 
 
