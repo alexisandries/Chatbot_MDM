@@ -1,6 +1,3 @@
-from models_config import get_model_for_role
-
-
 """Translation view: upload or paste content, translate, upgrade, download.
 
 This module renders the Translation interface and wires together the
@@ -29,6 +26,28 @@ display, optional upgrade, and Word export. The passive glossary
 compliance check runs for the text path; for the native path there is no
 extracted source text to compare against, so it naturally no-ops.
 
+HOW TRANSLATIONS APPEAR ON SCREEN
+=================================
+Translating and upgrading both write to the page live: the service hands
+back an iterator of text fragments and st.write_stream() renders them as
+they arrive, the same way the chatbot answers. This matters for more than
+comfort — a long translation can occupy the model for several minutes,
+and a motionless spinner gives the user no way to tell progress from a
+hang.
+
+Each run therefore has two phases:
+
+  1. Live phase. The text streams in below the input area, the glossary
+     compliance check runs, everything is written to session_state, and
+     the script reruns.
+  2. Settled phase. After the rerun, _render_results() draws the stored
+     text as a static block, together with the copy, upgrade and download
+     controls.
+
+The rerun is what prevents the translation being drawn twice (once by the
+stream, once by the results section). It also means the streamed text
+briefly moves position as it settles into the results panel.
+
 All results are kept in session_state so they survive Streamlit reruns.
 """
 
@@ -39,8 +58,8 @@ import doc_export
 import file_readers
 import language
 import translation_service
+from models_config import get_model_for_role
 from session import select_translation_model
-
 
 # Target languages offered as named options, mapped to their ISO codes.
 # "Other" lets the user type any ISO code.
@@ -82,11 +101,13 @@ def _select_target_language() -> str:
     choice = st.selectbox(
         "Target language", options, index=1, key="translation_target_choice"
     )
+
     if choice == "Other":
         return st.text_input(
             "Target language ISO code (e.g. 'de')",
             key="translation_target_other",
         ).strip().lower()
+
     return _NAMED_TARGET_LANGUAGES[choice]
 
 
@@ -104,8 +125,12 @@ def _extract_office_and_text(uploaded_file, manual_text: str) -> str:
     if uploaded_file is not None:
         try:
             file_text = file_readers.extract_text(uploaded_file)
-        except (file_readers.FileTooLargeError, file_readers.UnsupportedFileError) as exc:
+        except (
+            file_readers.FileTooLargeError,
+            file_readers.UnsupportedFileError,
+        ) as exc:
             st.error(str(exc))
+
     parts = [part for part in (file_text, manual_text) if part and part.strip()]
     return "\n".join(parts)
 
@@ -149,6 +174,7 @@ def _render_compliance(discrepancies: list[dict]) -> None:
     """
     if not discrepancies:
         return
+
     lines = [
         f"- The official term **{item['official_translation']}** "
         f"(for '{item['glossary_term']}') appears to be missing or replaced."
@@ -160,31 +186,110 @@ def _render_compliance(discrepancies: list[dict]) -> None:
     )
 
 
-def _store_result(result, source_text: str, target_code: str, compliance: list) -> None:
+def _consume_stream(fragments) -> str | None:
+    """Render a stream of text fragments live and return the full text.
+
+    Draws the fragments inside a bordered container so the live text sits
+    where the finished translation will appear after the rerun. Any
+    service error raised mid-stream is shown to the user and reported as
+    a failure.
+
+    Args:
+        fragments: Iterator of text fragments from translation_service.
+
+    Returns:
+        The complete text, or None if the stream failed. A None return
+        means the error has already been displayed; the caller should
+        just stop.
+    """
+    with st.container(border=True):
+        try:
+            return st.write_stream(fragments)
+        except translation_service.TranslationError as exc:
+            st.error(str(exc))
+            return None
+
+
+def _store_result(
+    prepared: translation_service.TranslationStream,
+    text: str,
+    source_text: str,
+    target_code: str,
+    compliance: list,
+) -> None:
     """Write a fresh translation result into session_state.
 
     Clears any previous refined translation so the view never shows a
     stale upgrade.
 
     Args:
-        result: The TranslationResult from the service.
+        prepared: The TranslationStream the text came from, carrying the
+            glossary instructions and source language metadata.
+        text: The complete translated text.
         source_text: The plain-text source ("" for native documents).
         target_code: Target language ISO code used.
         compliance: The compliance discrepancies for the base translation.
     """
-    st.session_state.translation_raw = result.text
-    st.session_state.translation_glossary_instructions = result.glossary_instructions
+    st.session_state.translation_raw = text
+    st.session_state.translation_glossary_instructions = (
+        prepared.glossary_instructions
+    )
     st.session_state.translation_source_text = source_text
-    st.session_state.translation_source_code = result.source_language_code
-    st.session_state.translation_source_name = result.source_language_name
+    st.session_state.translation_source_code = prepared.source_language_code
+    st.session_state.translation_source_name = prepared.source_language_name
     st.session_state.translation_target_code = target_code
     st.session_state.translation_compliance = compliance
     st.session_state.translation_refined = ""
     st.session_state.translation_refined_compliance = []
 
 
-def _run_text_translation(combined_text: str, target_code: str, role: str) -> None:
-    """Translate pasted/Office text and store the results.
+def _run_translation(
+    prepared: translation_service.TranslationStream,
+    source_text: str,
+    target_code: str,
+) -> None:
+    """Stream a prepared translation, check it, store it and rerun.
+
+    Shared tail of both input paths: everything from the first fragment
+    on screen to the rerun that hands over to _render_results().
+
+    Args:
+        prepared: The TranslationStream returned by the service.
+        source_text: The plain-text source, or "" for native documents.
+            An empty source disables the compliance check, which has
+            nothing to compare against.
+        target_code: Target language ISO code used.
+    """
+    st.caption(f"Source: {prepared.source_language_name}")
+
+    text = _consume_stream(prepared.fragments)
+    if text is None:
+        return
+
+    compliance = []
+    if source_text:
+        try:
+            with st.spinner("Checking terminology..."):
+                compliance = translation_service.check_compliance(
+                    source_text,
+                    text,
+                    prepared.source_language_code,
+                    target_code,
+                )
+        except translation_service.TranslationError as exc:
+            st.error(str(exc))
+            return
+
+    _store_result(prepared, text, source_text, target_code, compliance)
+    # Redraw the page so the finished translation appears once, in the
+    # results section, with its copy/upgrade/download controls.
+    st.rerun()
+
+
+def _run_text_translation(
+    combined_text: str, target_code: str, role: str
+) -> None:
+    """Translate pasted/Office text, streaming it to the screen.
 
     Args:
         combined_text: The source text to translate.
@@ -199,23 +304,18 @@ def _run_text_translation(combined_text: str, target_code: str, role: str) -> No
         return
 
     try:
-        with st.spinner("Translating..."):
-            result = translation_service.translate_text(
-                combined_text, source_code, target_code, role
-            )
-        with st.spinner("Checking terminology..."):
-            compliance = translation_service.check_compliance(
-                combined_text, result.text, source_code, target_code
-            )
+        prepared = translation_service.stream_text_translation(
+            combined_text, source_code, target_code, role
+        )
     except translation_service.TranslationError as exc:
         st.error(str(exc))
         return
 
-    _store_result(result, combined_text, target_code, compliance)
+    _run_translation(prepared, combined_text, target_code)
 
 
 def _run_native_translation(uploaded_file, target_code: str, role: str) -> None:
-    """Translate a PDF/image document natively and store the results.
+    """Translate a PDF/image document natively, streaming it to the screen.
 
     Args:
         uploaded_file: The uploaded PDF or image.
@@ -223,38 +323,47 @@ def _run_native_translation(uploaded_file, target_code: str, role: str) -> None:
         role: The model role to translate with.
     """
     try:
-        with st.spinner("Reading and translating the document..."):
-            result = translation_service.translate_document(
-                [uploaded_file], target_code, role
-            )
+        prepared = translation_service.stream_document_translation(
+            [uploaded_file], target_code, role
+        )
     except translation_service.TranslationError as exc:
         st.error(str(exc))
         return
 
     # No plain-text source for native documents, so the compliance check
     # (which derives expected terms from the source) does not apply.
-    _store_result(result, "", target_code, [])
+    _run_translation(prepared, "", target_code)
 
 
 def _run_upgrade(user_feedback: str) -> None:
-    """Upgrade the stored base translation and store the refined result.
+    """Upgrade the stored base translation, streaming it to the screen.
 
     Args:
         user_feedback: Free-text guidance from the user. May be empty.
     """
     try:
-        with st.spinner("Upgrading with the premium model..."):
-            refined = translation_service.upgrade_translation(
-                source_text=st.session_state.translation_source_text,
-                current_translation=st.session_state.translation_raw,
-                user_feedback=user_feedback,
-                source_language_code=st.session_state.translation_source_code,
-                target_language_code=st.session_state.translation_target_code,
-                glossary_instructions=st.session_state.translation_glossary_instructions,
-            )
-        # Compliance only applies when there is a plain-text source.
-        compliance = []
-        if st.session_state.translation_source_text:
+        fragments = translation_service.stream_upgrade(
+            source_text=st.session_state.translation_source_text,
+            current_translation=st.session_state.translation_raw,
+            user_feedback=user_feedback,
+            source_language_code=st.session_state.translation_source_code,
+            target_language_code=st.session_state.translation_target_code,
+            glossary_instructions=(
+                st.session_state.translation_glossary_instructions
+            ),
+        )
+    except translation_service.TranslationError as exc:
+        st.error(str(exc))
+        return
+
+    refined = _consume_stream(fragments)
+    if refined is None:
+        return
+
+    # Compliance only applies when there is a plain-text source.
+    compliance = []
+    if st.session_state.translation_source_text:
+        try:
             with st.spinner("Checking terminology..."):
                 compliance = translation_service.check_compliance(
                     st.session_state.translation_source_text,
@@ -262,12 +371,15 @@ def _run_upgrade(user_feedback: str) -> None:
                     st.session_state.translation_source_code,
                     st.session_state.translation_target_code,
                 )
-    except translation_service.TranslationError as exc:
-        st.error(str(exc))
-        return
+        except translation_service.TranslationError as exc:
+            st.error(str(exc))
+            return
 
     st.session_state.translation_refined = refined
     st.session_state.translation_refined_compliance = compliance
+    # Redraw so the upgraded text settles into its place below the base
+    # translation instead of appearing twice.
+    st.rerun()
 
 
 def _render_results() -> None:
@@ -281,8 +393,10 @@ def _render_results() -> None:
 
     st.divider()
     st.caption(f"Source: {st.session_state.translation_source_name}")
+
     with st.container(border=True):
         st.write(st.session_state.translation_raw)
+
     _render_copy(st.session_state.translation_raw)
     _render_compliance(st.session_state.translation_compliance)
 
@@ -293,10 +407,12 @@ def _render_results() -> None:
         f"The upgrade always uses {premium_model.display_name}, "
         f"whichever model is selected on the left."
     )
+
     feedback = st.text_input(
         "Your feedback or guidelines (optional)",
         key=f"translation_feedback_{st.session_state.translation_input_nonce}",
     )
+
     if st.button("Upgrade 🚀", type="primary", key="translation_upgrade"):
         _run_upgrade(feedback)
 
@@ -362,12 +478,15 @@ def render() -> None:
             "For a cleaner result — especially with images, footnotes or rich "
             "layout — export this document to PDF and upload the PDF instead."
         )
+
     if is_native and manual_text.strip():
         st.caption("The pasted text is ignored when a PDF or image is uploaded.")
 
     # Advisory cost estimate, per path.
     if is_native:
-        _show_estimate(translation_service.estimate_document_tokens([uploaded_file]))
+        _show_estimate(
+            translation_service.estimate_document_tokens([uploaded_file])
+        )
     else:
         combined_text = _extract_office_and_text(uploaded_file, manual_text)
         if combined_text.strip():
