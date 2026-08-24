@@ -29,12 +29,14 @@ That constraint buys three concrete benefits:
      change will be: add the new SDK import, add a branch in complete()
      and stream(), extend the guard. Callers will not notice.
 
-REASONING (THINKING AND EFFORT)
-================================
-Reasoning depth is expressed as a named level ("Off", "Standard",
-"Deep", "Extended") defined in models_config.REASONING_LEVELS, not as a
-token budget. The gateway translates the level into the two parameters
-the API expects:
+STEERING THE ANSWER (THINKING AND EFFORT)
+==========================================
+The Messages API exposes no sampling parameters: there is no
+temperature, no top_p, no top_k. What a caller can steer is how much
+the model reasons and how many tokens it may spend. That is expressed
+as a named reasoning level ("Off", "Standard", "Deep", "Extended")
+defined in models_config.REASONING_LEVELS, which the gateway translates
+into the two parameters the API expects:
 
     thinking      {"type": "adaptive"} or {"type": "disabled"}
     output_config {"effort": "low" | "medium" | "high" | "xhigh"}
@@ -315,7 +317,6 @@ def complete(
     system: str,
     prompt: str | None = None,
     messages: list[dict] | None = None,
-    temperature: float | None = None,
     max_tokens: int | None = None,
     reasoning: str | None = None,
 ) -> str:
@@ -339,9 +340,6 @@ def complete(
         messages: Full conversation history as a list of
             {"role": ..., "content": ...} dicts. Mutually exclusive
             with `prompt`.
-        temperature: Sampling temperature. Defaults to the model's
-            default_temperature from the registry. Silently ignored for
-            models whose registry entry sets supports_temperature=False.
         max_tokens: Output token cap, thinking tokens included. Defaults
             to the model's default_max_tokens from the registry.
         reasoning: Name of a level in models_config.REASONING_LEVELS.
@@ -372,13 +370,6 @@ def complete(
         ),
         **_reasoning_params(spec, reasoning),
     }
-
-    # Only send temperature to models that accept it; some models reject
-    # the parameter outright.
-    if spec.supports_temperature:
-        params["temperature"] = (
-            temperature if temperature is not None else spec.default_temperature
-        )
 
     try:
         with client.messages.stream(**params) as event_stream:
@@ -411,7 +402,6 @@ def complete_json(
     role: str,
     system: str,
     prompt: str,
-    temperature: float = 0.0,
     max_tokens: int | None = None,
 ):
     """Run a completion and parse the answer as JSON.
@@ -422,14 +412,15 @@ def complete_json(
     adds robustness by stripping Markdown code fences before parsing.
 
     Reasoning is disabled: structured extraction is a mechanical task,
-    and reasoning would add cost and latency for no benefit.
+    and reasoning would add cost and latency for no benefit. Consistency
+    of the output rests entirely on how strictly the prompt demands
+    JSON, since the API offers no sampling controls to make a call more
+    deterministic.
 
     Args:
         role: Model role, typically "utility".
         system: System prompt (must demand JSON-only output).
         prompt: User message containing the task and the data.
-        temperature: Sampling temperature. Defaults to 0.0 because
-            structured extraction should be deterministic.
         max_tokens: Output token cap. Defaults to the model's registry
             value.
 
@@ -444,7 +435,6 @@ def complete_json(
         role=role,
         system=system,
         prompt=prompt,
-        temperature=temperature,
         max_tokens=max_tokens,
         reasoning="Off",
     )
@@ -468,7 +458,6 @@ def stream(
     role: str,
     system: str,
     messages: list[dict],
-    temperature: float | None = None,
     max_tokens: int | None = None,
     tools: list[dict] | None = None,
     reasoning: str | None = None,
@@ -487,9 +476,6 @@ def stream(
         system: System prompt for the conversation.
         messages: Full conversation history as a list of
             {"role": "user"|"assistant", "content": str} dicts.
-        temperature: Sampling temperature. Defaults to the model's
-            registry value. Silently ignored for models whose registry
-            entry sets supports_temperature=False.
         max_tokens: Output token cap, thinking tokens included. Defaults
             to the model's registry value. A high reasoning level with a
             low ceiling can truncate the answer.
@@ -520,12 +506,6 @@ def stream(
         ),
         **_reasoning_params(spec, reasoning),
     }
-
-    if spec.supports_temperature:
-        params["temperature"] = (
-            temperature if temperature is not None
-            else spec.default_temperature
-        )
 
     if tools:
         params["tools"] = tools
