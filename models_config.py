@@ -16,6 +16,13 @@ How to update a model:
     1. Add or edit a ModelSpec entry in MODEL_REGISTRY.
     2. If needed, repoint a role in ROLE_TO_MODEL.
     That's it - do not touch any other file.
+
+A note on sampling parameters:
+    The Messages API exposes no sampling controls (no temperature, no
+    top_p, no top_k). How long and how deeply a model answers is steered
+    entirely through the reasoning levels defined at the bottom of this
+    module. A ModelSpec therefore carries only a token ceiling and the
+    flags describing which reasoning parameters the model accepts.
 """
 
 from dataclasses import dataclass
@@ -42,14 +49,10 @@ class ModelSpec:
             quality level and relative cost of the model. Written for
             end users, not developers. Kept generic (not specific to
             translation) so it reads well in every view that shows it.
-        default_temperature: Temperature used when the caller does not
-            specify one. Lower values favour safe, consistent output.
         default_max_tokens: Maximum number of output tokens used when
             the caller does not specify a value. Sized generously
-            because a translation can be as long as its source text.
-        supports_temperature: Whether the model accepts a temperature
-            parameter. Some models reject it; when this is False, the
-            LLM gateway omits temperature from the request entirely.
+            because a translation can be as long as its source text,
+            and because thinking tokens count towards this ceiling.
         supports_adaptive_thinking: Whether the model accepts
             thinking={"type": "adaptive"}. Current-generation models do;
             Haiku 4.5 and earlier models only support the legacy
@@ -65,9 +68,7 @@ class ModelSpec:
     display_name: str
     provider: str
     description: str
-    default_temperature: float
     default_max_tokens: int
-    supports_temperature: bool = True
     supports_adaptive_thinking: bool = True
     supports_effort: bool = True
 
@@ -86,7 +87,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "internal use. For anything shared externally, a higher tier "
             "is recommended."
         ),
-        default_temperature=0.2,
         default_max_tokens=16384,
         # Haiku 4.5 predates both adaptive thinking and the effort
         # parameter; sending either returns a 400 error.
@@ -102,9 +102,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "Strong on nuance, tone and natural phrasing. Recommended "
             "default for most work."
         ),
-        default_temperature=0.3,
         default_max_tokens=64000,
-        supports_temperature=False,
     ),
     "opus": ModelSpec(
         api_id="claude-opus-5",
@@ -115,13 +113,9 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "Best for complex tasks, demanding enterprise work, and for "
             "refining results. Slower than the standard and fast tiers."
         ),
-        default_temperature=0.4,
         # Thinking tokens count towards max_tokens, so this ceiling must
         # leave room for both the reasoning and the visible answer.
         default_max_tokens=64000,
-        # Opus 5 rejects the temperature parameter, so the gateway must
-        # omit it for this model.
-        supports_temperature=False,
     ),
     "fable": ModelSpec(
         api_id="claude-fable-5",
@@ -133,12 +127,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "long, difficult problems. Reserve it for work where the extra "
             "quality is worth the cost."
         ),
-        default_temperature=0.4,
         default_max_tokens=64000,
-        # Like the other current-generation models, Fable 5 rejects the
-        # temperature parameter; response length and depth are steered
-        # through the effort setting instead.
-        supports_temperature=False,
     ),
 }
 
@@ -188,8 +177,7 @@ CHATBOT_SELECTABLE_ROLES: list[str] = ["standard", "premium", "frontier"]
 # ---------------------------------------------------------------------------
 # Reasoning levels
 # ---------------------------------------------------------------------------
-# Current Claude models no longer accept a thinking token budget. Two
-# parameters replace it:
+# Two parameters steer how a model answers:
 #   - thinking: "adaptive" lets the model decide when and how deeply to
 #     reason; "disabled" forbids reasoning entirely.
 #   - output_config.effort: how many tokens the model may spend on the
