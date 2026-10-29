@@ -21,8 +21,16 @@ A note on sampling parameters:
     The Messages API exposes no sampling controls (no temperature, no
     top_p, no top_k). How long and how deeply a model answers is steered
     entirely through the reasoning levels defined at the bottom of this
-    module. A ModelSpec therefore carries only a token ceiling and the
-    flags describing which reasoning parameters the model accepts.
+    module. A ModelSpec therefore carries only a token ceiling and a
+    description of how the model lets thinking be switched off.
+
+A note on thinking:
+    Every current Claude model reasons ("thinks") before answering, using
+    adaptive thinking: the model decides on its own when and how much to
+    think, and the `effort` parameter is the dial that controls that
+    amount. Models differ only in whether thinking can be switched off
+    entirely, and in which API value does it. That difference is captured
+    per model by ModelSpec.thinking_off_mode (see its docstring).
 """
 
 from dataclasses import dataclass
@@ -38,10 +46,10 @@ class ModelSpec:
 
     Attributes:
         api_id: Exact model string expected by the provider's API
-            (e.g. "claude-sonnet-5"). This is the only place in the
+            (e.g. "claude-sonnet-5-5"). This is the only place in the
             codebase where such strings may appear.
         display_name: Human-friendly name shown in the UI
-            (e.g. "Claude Sonnet 5").
+            (e.g. "Claude Sonnet 5.5").
         provider: Provider key, currently always "anthropic". Kept as a
             field so a second provider (e.g. "mistral") can be added
             later without changing the registry's structure.
@@ -53,15 +61,22 @@ class ModelSpec:
             the caller does not specify a value. Sized generously
             because a translation can be as long as its source text,
             and because thinking tokens count towards this ceiling.
-        supports_adaptive_thinking: Whether the model accepts
-            thinking={"type": "adaptive"}. Current-generation models do;
-            Haiku 4.5 and earlier models only support the legacy
-            fixed-budget thinking mode and reject "adaptive" with a 400
-            error. When False, the gateway sends no thinking parameter.
-        supports_effort: Whether the model accepts
-            output_config={"effort": ...}, the parameter that steers how
-            many tokens the model spends on a response. Haiku 4.5 does
-            not support it. When False, the gateway omits it.
+        thinking_off_mode: How the model lets a caller switch thinking
+            off, i.e. which value the gateway must send as
+            thinking={"type": ...} when a reasoning level asks for no
+            thinking. One of:
+              - "disabled": the model accepts thinking={"type": "disabled"}
+                (only at effort "high" or below; the API rejects it at
+                "xhigh" and "max").
+              - "between_tools": the model rejects "disabled" and uses
+                thinking={"type": "between_tools"} instead, which turns
+                off up-front reasoning (same effort restriction as above).
+              - None: thinking is always on and cannot be switched off.
+                The gateway then falls back to adaptive thinking at the
+                level's effort, which at "low" effort means very little
+                reasoning in practice.
+            Any model accepts thinking={"type": "adaptive"} and the
+            output_config.effort parameter, so no flag is needed for those.
     """
 
     api_id: str
@@ -69,65 +84,75 @@ class ModelSpec:
     provider: str
     description: str
     default_max_tokens: int
-    supports_adaptive_thinking: bool = True
-    supports_effort: bool = True
+    thinking_off_mode: str | None
 
 
 # ---------------------------------------------------------------------------
 # Registry: every model the app can use, keyed by a short internal name
 # ---------------------------------------------------------------------------
+# List prices (USD per million tokens, input / output) at the time of
+# writing, used to word the relative-cost hints in the descriptions:
+#   Haiku 5.5   0.10 / 0.50   (5x more for prompts above 100k tokens;
+#                              the app's chunking keeps prompts far below)
+#   Sonnet 5.5  2 / 10        (about 20x Haiku)
+#   Opus 5.5    4 / 20        (about 2x Sonnet)
+#   Fable 5.1   10 / 50       (about 2.5x Opus)
 
 MODEL_REGISTRY: dict[str, ModelSpec] = {
     "haiku": ModelSpec(
-        api_id="claude-haiku-4-5-20251001",
-        display_name="Claude Haiku 4.5",
+        api_id="claude-haiku-5-5",
+        display_name="Claude Haiku 5.5",
         provider="anthropic",
         description=(
-            "Fast and nearly free. Good for simple, everyday text and "
-            "internal use. For anything shared externally, a higher tier "
-            "is recommended."
+            "Fast and nearly free (about 20x cheaper than the standard "
+            "tier). Good for simple, everyday text and internal use. For "
+            "anything shared externally, a higher tier is recommended."
         ),
-        default_max_tokens=16384,
-        # Haiku 4.5 predates both adaptive thinking and the effort
-        # parameter; sending either returns a 400 error.
-        supports_adaptive_thinking=False,
-        supports_effort=False,
+        # Thinking is switched off for the mechanical tasks this model
+        # runs (translation, glossary detection), so this ceiling only
+        # has to hold the visible answer of one text chunk.
+        default_max_tokens=32000,
+        thinking_off_mode="disabled",
     ),
     "sonnet": ModelSpec(
-        api_id="claude-sonnet-5",
-        display_name="Claude Sonnet 5",
+        api_id="claude-sonnet-5-5",
+        display_name="Claude Sonnet 5.5",
         provider="anthropic",
         description=(
-            "High quality at a moderate cost (about 3x the economy tier). "
-            "Strong on nuance, tone and natural phrasing. Recommended "
-            "default for most work."
+            "High quality at a moderate cost. Strong on nuance, tone and "
+            "natural phrasing. Recommended default for most work."
         ),
         default_max_tokens=64000,
+        # Sonnet 5.5 rejects thinking={"type": "disabled"} with a 400
+        # error at every effort level; "between_tools" is its equivalent.
+        thinking_off_mode="between_tools",
     ),
     "opus": ModelSpec(
-        api_id="claude-opus-5",
-        display_name="Claude Opus 5",
+        api_id="claude-opus-5-5",
+        display_name="Claude Opus 5.5",
         provider="anthropic",
         description=(
-            "High-end quality at moderate cost (about 1.7x the standard tier). "
-            "Best for complex tasks, demanding enterprise work, and for "
-            "refining results. Slower than the standard and fast tiers."
+            "High-end quality at about 2x the standard tier. Best for "
+            "complex tasks, demanding enterprise work, and for refining "
+            "results. Slower than the standard and fast tiers."
         ),
-        # Thinking tokens count towards max_tokens, so this ceiling must
-        # leave room for both the reasoning and the visible answer.
+        # Thinking is always on and counts towards max_tokens, so this
+        # ceiling must leave room for both the reasoning and the answer.
         default_max_tokens=64000,
+        thinking_off_mode=None,
     ),
     "fable": ModelSpec(
-        api_id="claude-fable-5",
-        display_name="Claude Fable 5",
+        api_id="claude-fable-5-1",
+        display_name="Claude Fable 5.1",
         provider="anthropic",
         description=(
-            "Top-of-the-range model, and the most expensive (about 2x the "
-            "high-end tier). Best for open-ended thinking, writing and "
+            "Top-of-the-range model, and the most expensive (about 2.5x "
+            "the high-end tier). Best for open-ended thinking, writing and "
             "long, difficult problems. Reserve it for work where the extra "
             "quality is worth the cost."
         ),
         default_max_tokens=64000,
+        thinking_off_mode=None,
     ),
 }
 
@@ -135,7 +160,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
 # ---------------------------------------------------------------------------
 # Roles: stable names used everywhere else in the application
 # ---------------------------------------------------------------------------
-# The application code NEVER asks for "sonnet" or "claude-sonnet-5";
+# The application code NEVER asks for "sonnet" or "claude-sonnet-5-5";
 # it asks for a role. Repointing a role to another model is a one-line
 # change here.
 
@@ -179,7 +204,8 @@ CHATBOT_SELECTABLE_ROLES: list[str] = ["standard", "premium", "frontier"]
 # ---------------------------------------------------------------------------
 # Two parameters steer how a model answers:
 #   - thinking: "adaptive" lets the model decide when and how deeply to
-#     reason; "disabled" forbids reasoning entirely.
+#     reason; the model-specific "off" value (see ModelSpec.thinking_off_mode)
+#     forbids up-front reasoning on models that allow it.
 #   - output_config.effort: how many tokens the model may spend on the
 #     whole response, thinking included.
 #
@@ -191,8 +217,12 @@ class ReasoningLevel:
     """One position of the chatbot's "Reasoning" slider.
 
     Attributes:
-        thinking_enabled: Whether the model may produce reasoning before
-            answering. False maps to thinking={"type": "disabled"}.
+        thinking_enabled: Whether the model may reason before answering.
+            True maps to thinking={"type": "adaptive"}. False asks the
+            gateway to switch thinking off using the model's own
+            thinking_off_mode; on models where thinking is always on,
+            the gateway keeps adaptive thinking and relies on the low
+            effort below to keep reasoning minimal.
         effort: Effort level sent as output_config.effort. Valid values,
             from cheapest to most expensive: "low", "medium", "high",
             "xhigh", "max". Higher levels mean longer, deeper and more
@@ -207,14 +237,14 @@ class ReasoningLevel:
 
 
 # Ordered from fastest and cheapest to slowest and most expensive.
-# Note: "Off" is paired with low effort on purpose. Opus 5 rejects
-# disabled thinking at "xhigh" and "max" effort, so those two must never
-# be combined with thinking_enabled=False.
+# Note: "Off" is paired with low effort on purpose. The API only allows
+# thinking to be switched off at effort "high" or below, so a level with
+# thinking_enabled=False must never use "xhigh" or "max".
 REASONING_LEVELS: dict[str, ReasoningLevel] = {
     "Off": ReasoningLevel(
         thinking_enabled=False,
         effort="low",
-        help_text="Fastest and cheapest. Answers directly, no reasoning.",
+        help_text="Fastest and cheapest. Answers directly, minimal reasoning.",
     ),
     "Standard": ReasoningLevel(
         thinking_enabled=True,
