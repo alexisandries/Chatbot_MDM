@@ -11,7 +11,7 @@ That constraint buys three concrete benefits:
 
   1. Model resolution by role, never by hard-coded string.
      Callers ask for role="standard" or role="utility". The actual API
-     model string (e.g. "claude-sonnet-5") is resolved through
+     model string (e.g. "claude-sonnet-5-5") is resolved through
      models_config.py. When Anthropic releases a new model and we want
      to upgrade a tier, we change one line in models_config.py and
      nothing else in the application changes.
@@ -38,13 +38,16 @@ as a named reasoning level ("Off", "Standard", "Deep", "Extended")
 defined in models_config.REASONING_LEVELS, which the gateway translates
 into the two parameters the API expects:
 
-    thinking      {"type": "adaptive"} or {"type": "disabled"}
+    thinking      {"type": "adaptive"} or the model's own "off" value
     output_config {"effort": "low" | "medium" | "high" | "xhigh"}
 
-Not every model accepts these parameters: Haiku 4.5 supports neither, so
-the registry flags `supports_adaptive_thinking` and `supports_effort`
-tell the gateway what to omit. Callers pass the same level regardless of
-the model; the gateway silently drops what the model cannot handle.
+Every model accepts adaptive thinking and the effort parameter. Models
+differ only in how (and whether) thinking can be switched off, which the
+registry records per model in `ModelSpec.thinking_off_mode`: "disabled",
+"between_tools", or None when thinking is always on. Callers pass the
+same level regardless of the model; the gateway picks the right API
+value, or keeps adaptive thinking at the level's (low) effort when the
+model cannot switch it off.
 
 Thinking tokens count towards `max_tokens`, so a high reasoning level on
 a small token ceiling can truncate the visible answer. The registry
@@ -268,21 +271,32 @@ def _reasoning_params(spec: ModelSpec, reasoning: str | None) -> dict:
     """Build the thinking and effort parameters for one request.
 
     Translates a reasoning level name into the API parameters the given
-    model actually supports. Anything the model cannot handle is simply
-    left out, so the same level can be passed for every model without
-    the caller having to know which one is selected.
+    model actually accepts, so the same level can be passed for every
+    model without the caller having to know which one is selected.
+
+    The effort value is always sent as given. The thinking value depends
+    on the level and on the model:
+      - level asks for thinking: {"type": "adaptive"} on every model;
+      - level asks for no thinking and the model can switch it off:
+        {"type": spec.thinking_off_mode}, i.e. "disabled" or
+        "between_tools" depending on the model;
+      - level asks for no thinking but the model cannot switch it off
+        (thinking_off_mode is None): {"type": "adaptive"} is sent anyway.
+        The level's low effort then keeps reasoning to a minimum, which
+        is the closest the API allows to "off" on such models.
 
     Args:
         spec: The model the request will be sent to. Its
-            supports_adaptive_thinking and supports_effort flags decide
-            which parameters are emitted.
+            thinking_off_mode decides which "off" value, if any, exists.
         reasoning: Name of a level defined in
             models_config.REASONING_LEVELS, or None to let the API apply
-            its own defaults (adaptive thinking at high effort).
+            its own defaults (adaptive thinking at the model's default
+            effort).
 
     Returns:
-        A dict to merge into the request parameters. It may be empty,
-        and may contain "thinking", "output_config", or both.
+        A dict to merge into the request parameters. It is empty when
+        `reasoning` is None, and otherwise contains both "thinking" and
+        "output_config".
 
     Raises:
         LLMError: If the reasoning level name is unknown.
@@ -295,17 +309,15 @@ def _reasoning_params(spec: ModelSpec, reasoning: str | None) -> dict:
     except KeyError as exc:
         raise LLMError(str(exc)) from exc
 
-    params: dict = {}
+    if level.thinking_enabled or spec.thinking_off_mode is None:
+        thinking_type = "adaptive"
+    else:
+        thinking_type = spec.thinking_off_mode
 
-    if spec.supports_adaptive_thinking:
-        params["thinking"] = {
-            "type": "adaptive" if level.thinking_enabled else "disabled"
-        }
-
-    if spec.supports_effort:
-        params["output_config"] = {"effort": level.effort}
-
-    return params
+    return {
+        "thinking": {"type": thinking_type},
+        "output_config": {"effort": level.effort},
+    }
 
 
 # ---------------------------------------------------------------------------
