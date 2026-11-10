@@ -96,7 +96,7 @@ class ModelSpec:
 #                              the app's chunking keeps prompts far below)
 #   Sonnet 5.5  2 / 10        (about 20x Haiku)
 #   Opus 5.5    4 / 20        (about 2x Sonnet)
-#   Fable 5.1   10 / 50       (about 2.5x Opus)
+#   Fable 5.2   8 / 40        (about 2x Opus)
 
 MODEL_REGISTRY: dict[str, ModelSpec] = {
     "haiku": ModelSpec(
@@ -142,16 +142,20 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         thinking_off_mode=None,
     ),
     "fable": ModelSpec(
-        api_id="claude-fable-5-1",
-        display_name="Claude Fable 5.1",
+        api_id="claude-fable-5-2",
+        display_name="Claude Fable 5.2",
         provider="anthropic",
         description=(
-            "Top-of-the-range model, and the most expensive (about 2.5x "
+            "Top-of-the-range model, and the most expensive (about 2x "
             "the high-end tier). Best for open-ended thinking, writing and "
             "long, difficult problems. Reserve it for work where the extra "
             "quality is worth the cost."
         ),
         default_max_tokens=64000,
+        # Thinking is always on: the API rejects thinking={"type":
+        # "disabled"} with a 400 error. At effort "xhigh" and above the
+        # model may also spend extra tokens reviewing its own work, so
+        # the "Extended" reasoning level is noticeably more costly here.
         thinking_off_mode=None,
     ),
 }
